@@ -4,8 +4,8 @@
 #
 # This script:
 # 1. Detects the Wine environment from MetaTrader 5.app
-# 2. Installs metatrader-mcp-server in Wine Python if needed
-# 3. Starts the MCP server with Wine bridge support
+# 2. Installs metatrader-mcp-server in Wine Python if needed (with numpy<2 fix)
+# 3. Starts the MCP server via Wine Python
 #
 # Usage:
 #   ./metatrader-mcp-server-macos --login 12345 --password pass --server Broker
@@ -59,12 +59,16 @@ fi
 export WINEPREFIX
 export WINEDEBUG="-all"
 
-# ── Check if metatrader-mcp-server is installed in Wine Python ──
-CHECK=$("$WINE_BIN" "$WINE_PYTHON" -c "import metatrader_mcp; print('OK')" 2>/dev/null || echo "NOT_INSTALLED")
+# ── Check if metatrader-mcp-server is installed and working ──
+CHECK=$("$WINE_BIN" "$WINE_PYTHON" -c "from metatrader_mcp.server import mcp; print('OK')" 2>/dev/null || echo "NOT_INSTALLED")
 
 if [ "$CHECK" != "OK" ]; then
     echo "Installing metatrader-mcp-server in Wine Python..." >&2
     "$WINE_BIN" "$WINE_PYTHON" -m pip install metatrader-mcp-server 2>&1 >&2
+    # CRITICAL: Downgrade numpy to 1.x for MetaTrader5 compatibility
+    # MetaTrader5 is compiled against numpy 1.x and crashes with numpy 2.x
+    "$WINE_BIN" "$WINE_PYTHON" -m pip install "numpy<2" --force-reinstall 2>&1 >&2
+    echo "Installation complete." >&2
 fi
 
 # ── Run MCP server via Wine Python ──
