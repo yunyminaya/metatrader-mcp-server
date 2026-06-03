@@ -1,0 +1,71 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# metatrader-mcp-server-macos — Wrapper to run the MCP server on macOS via Wine
+#
+# This script:
+# 1. Detects the Wine environment from MetaTrader 5.app
+# 2. Installs metatrader-mcp-server in Wine Python if needed
+# 3. Starts the MCP server with Wine bridge support
+#
+# Usage:
+#   ./metatrader-mcp-server-macos --login 12345 --password pass --server Broker
+#
+# Add to Roo MCP config:
+#   {
+#     "mcpServers": {
+#       "metatrader": {
+#         "command": "/path/to/metatrader-mcp-server-macos",
+#         "args": ["--login", "YOUR_LOGIN", "--password", "YOUR_PASS", "--server", "YOUR_SERVER"]
+#       }
+#     }
+#   }
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+# ── Detect Wine Environment ──
+MT5_APP="/Applications/MetaTrader 5.app"
+WINE_BIN="$MT5_APP/Contents/SharedSupport/wine/bin/wine"
+
+# Find Wine prefix
+WINEPREFIX=""
+for prefix in \
+    "$HOME/Library/Application Support/net.metaquotes.wine.metatrader5" \
+    "$HOME/Library/Application Support/net.metaquotes.wine.MetaTrader5.tastyfx"; do
+    if [ -d "$prefix/drive_c" ]; then
+        WINEPREFIX="$prefix"
+        break
+    fi
+done
+
+if [ -z "$WINEPREFIX" ]; then
+    echo "ERROR: MetaTrader 5 Wine prefix not found" >&2
+    echo "Please install MetaTrader 5 from https://www.metatrader5.com/en/download" >&2
+    exit 1
+fi
+
+if [ ! -f "$WINE_BIN" ]; then
+    echo "ERROR: Wine not found at $WINE_BIN" >&2
+    echo "Please install MetaTrader 5.app" >&2
+    exit 1
+fi
+
+WINE_PYTHON="$WINEPREFIX/drive_c/Python312/python.exe"
+if [ ! -f "$WINE_PYTHON" ]; then
+    echo "ERROR: Wine Python not found at $WINE_PYTHON" >&2
+    exit 1
+fi
+
+export WINEPREFIX
+export WINEDEBUG="-all"
+
+# ── Check if metatrader-mcp-server is installed in Wine Python ──
+CHECK=$("$WINE_BIN" "$WINE_PYTHON" -c "import metatrader_mcp; print('OK')" 2>/dev/null || echo "NOT_INSTALLED")
+
+if [ "$CHECK" != "OK" ]; then
+    echo "Installing metatrader-mcp-server in Wine Python..." >&2
+    "$WINE_BIN" "$WINE_PYTHON" -m pip install metatrader-mcp-server 2>&1 >&2
+fi
+
+# ── Run MCP server via Wine Python ──
+exec "$WINE_BIN" "$WINE_PYTHON" -m metatrader_mcp.cli "$@"
