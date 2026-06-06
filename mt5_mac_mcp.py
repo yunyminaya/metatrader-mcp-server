@@ -50,6 +50,52 @@ MAX_OPEN_POSITIONS = 1
 MAX_MARGIN_USE_PCT = 65.0
 MIN_POST_TRADE_FREE_MARGIN_PCT = 30.0
 MAX_SPREAD_POINTS = 80
+DAILY_RISK_FILE = DATA_DIR / "daily_risk.json"
+
+def _load_daily_risk() -> dict:
+    if not DAILY_RISK_FILE.exists():
+        return {"max_loss": 0.0, "max_trades": 0, "trades_today": 0, "date": ""}
+    try:
+        return json.loads(DAILY_RISK_FILE.read_text())
+    except Exception:
+        return {"max_loss": 0.0, "max_trades": 0, "trades_today": 0, "date": ""}
+
+def _save_daily_risk(state: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DAILY_RISK_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+def _guard_daily_risk() -> Optional[str]:
+    risk = _load_daily_risk()
+    limit = risk.get("max_loss", 0.0)
+    if limit <= 0:
+        return None
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if risk.get("date") != today:
+        return None
+    # Calculate today's PnL from history
+    today_pnl = 0.0
+    today_ts = int(datetime.strptime(today + " 00:00:00", "%Y-%m-%d %H:%M:%S").timestamp())
+    try:
+        hist = _mt5_direct({"action": "history", "from": today_ts, "to": int(time.time()) + 86400})
+        deals = hist.get("deals", hist.get("data", []))
+        if isinstance(deals, list):
+            for d in deals:
+                if isinstance(d, dict):
+                    today_pnl += d.get("profit", 0.0) + d.get("swap", 0.0) + d.get("commission", 0.0)
+    except Exception:
+        pass
+    # Add floating PnL from open positions
+    try:
+        positions = _mt5_direct({"action": "positions"})
+        pos_list = positions.get("positions", positions.get("data", []))
+        if isinstance(pos_list, list):
+            for p in pos_list:
+                today_pnl += p.get("profit", p.get("floating_pnl", 0.0)) if isinstance(p, dict) else 0
+    except Exception:
+        pass
+    if today_pnl <= -limit:
+        return f"Daily loss limit reached: {today_pnl:.2f} <= -{limit:.2f}"
+    return None
 
 _FX_PAIRS = {"EURUSD","GBPUSD","USDJPY","USDCAD","USDCHF","AUDUSD","NZDUSD",
              "EURGBP","EURJPY","EURCHF","AUDJPY","GBPJPY","CHFJPY","EURAUD",
@@ -374,6 +420,18 @@ def _parse_check(raw: str) -> Dict[str, Any]:
     return data
 
 
+def _intel_import(name):
+    """Lazy-import a function from the intelligence module."""
+    try:
+        mod = sys.modules.get("mt5_mcp_intelligence")
+        if mod is None:
+            import importlib
+            mod = importlib.import_module("mt5_mcp_intelligence")
+        return getattr(mod, name, None)
+    except Exception:
+        return None
+
+
 def _guard_live_order(order_type: str, symbol: str, volume: float, sl: float, tp: float) -> Dict[str, Any]:
     sym = _fix_sym(symbol)
     account = _mt5_direct({"action": "account"})
@@ -390,6 +448,9 @@ def _guard_live_order(order_type: str, symbol: str, volume: float, sl: float, tp
     })
 
     reasons = []
+    warnings = []
+
+    # ── Hard limits ──
     if volume > MAX_LIVE_VOLUME:
         reasons.append(f"volume {volume:.2f} > max_live_volume {MAX_LIVE_VOLUME:.2f}")
     if positions.get("count", 0) >= MAX_OPEN_POSITIONS:
@@ -397,6 +458,9 @@ def _guard_live_order(order_type: str, symbol: str, volume: float, sl: float, tp
     spread_points = int(price.get("spread", 0) or 0)
     if spread_points > MAX_SPREAD_POINTS:
         reasons.append(f"spread {spread_points} points > limit {MAX_SPREAD_POINTS}")
+    daily_reason = _guard_daily_risk()
+    if daily_reason:
+        reasons.append(daily_reason)
     check_result = check.get("result", {})
     retcode = int(check_result.get("retcode", 0) or 0)
     if retcode not in (0, 10009):
@@ -413,9 +477,94 @@ def _guard_live_order(order_type: str, symbol: str, volume: float, sl: float, tp
     if post_free_pct < MIN_POST_TRADE_FREE_MARGIN_PCT:
         reasons.append(f"post-trade free margin {post_free_pct:.1f}% < limit {MIN_POST_TRADE_FREE_MARGIN_PCT:.1f}%")
 
-    return {
+    # ── Intelligence guard: news check ──
+    try:
+        news_fn = _intel_import("news_check")
+        if news_fn:
+            news = news_fn()
+        else:
+            news = _intelligence_tools.get("news_check", (None,))[0]({}) if "news_check" in _intelligence_tools else {}
+        if isinstance(news, dict) and news.get("has_event") and news.get("within_2h"):
+            reasons.append(f"high-impact news nearby: {[e.get('name','?') for e in news.get('events',[])]}")
+    except Exception:
+        pass
+
+    # ── Intelligence guard: session quality ──
+    try:
+        ses_fn = _intel_import("market_sessions")
+        if ses_fn:
+            ses = ses_fn()
+        else:
+            ses = _intelligence_tools.get("market_sessions", (None,))[0]({}) if "market_sessions" in _intelligence_tools else {}
+        if isinstance(ses, dict):
+            quality = ses.get("quality", 1.0)
+            if quality < 0.5:
+                reasons.append(f"low liquidity session (quality={quality:.0%}), active: {ses.get('active_sessions', [])}")
+            elif quality < 0.8:
+                warnings.append(f"reduced liquidity (quality={quality:.0%})")
+    except Exception:
+        pass
+
+    # ── Intelligence guard: stop-hunting / manipulation ──
+    try:
+        man_fn = _intel_import("analyze_manipulation")
+        if man_fn:
+            man = man_fn(_mt5_direct, sym.replace(".FX", ""))
+        else:
+            man = _intelligence_tools.get("antimanipulation_analyze", (None,))[0]({"symbol": sym.replace(".FX", "")}) if "antimanipulation_analyze" in _intelligence_tools else {}
+        if isinstance(man, dict):
+            if man.get("stop_hunting_risk") == "high":
+                reasons.append(f"high stop-hunting risk detected ({man.get('suspicious_spikes',0)} suspicious spikes)")
+            elif man.get("stop_hunting_risk") == "medium":
+                warnings.append(f"medium stop-hunting risk ({man.get('suspicious_spikes',0)} spikes)")
+    except Exception:
+        pass
+
+    # ── Intelligence guard: regime adaptation ──
+    try:
+        reg_fn = _intel_import("regime_detect")
+        if reg_fn:
+            regime = reg_fn(_mt5_direct, sym.replace(".FX", ""), "H1", 14)
+        else:
+            regime = _intelligence_tools.get("regime_detect", (None,))[0]({"symbol": sym.replace(".FX", "")}) if "regime_detect" in _intelligence_tools else {}
+        if isinstance(regime, dict):
+            r = regime.get("regime", "unknown")
+            if r == "volatile":
+                reasons.append(f"volatile market regime — avoid new entries")
+            elif r == "quiet":
+                warnings.append(f"quiet market — reduce size expectations")
+            else:
+                warnings.append(f"market regime: {r}")
+    except Exception:
+        pass
+
+    # ── Intelligence guard: correlation overexposure ──
+    try:
+        corr_fn = _intel_import("correlation_report")
+        if corr_fn:
+            corr = corr_fn()
+        else:
+            corr = _intelligence_tools.get("correlation_analyze", (None,))[0]({}) if "correlation_analyze" in _intelligence_tools else {}
+        if isinstance(corr, dict):
+            correlated = corr.get("correlated_pairs", [])
+            if correlated and positions.get("count", 0) > 0:
+                base_sym = sym.replace(".FX", "")
+                for p in positions.get("positions", []):
+                    psym = p.get("symbol", "").replace(".FX", "")
+                    ptype = "BUY" if p.get("type") in (0, "POSITION_TYPE_BUY") else "SELL"
+                    for entry in correlated:
+                        if isinstance(entry, dict) and entry.get("pair1") == base_sym and entry.get("pair2") == psym:
+                            corr_val = entry.get("correlation", 0)
+                            if abs(corr_val) > 0.7 and order_type == ptype:
+                                warnings.append(f"high correlation {base_sym}/{psym}={corr_val:.2f} — overexposed {order_type}")
+                            break
+    except Exception:
+        pass
+
+    result = {
         "allowed": not reasons,
         "reasons": reasons,
+        "warnings": warnings,
         "account": account,
         "price": price,
         "positions": positions,
@@ -430,6 +579,7 @@ def _guard_live_order(order_type: str, symbol: str, volume: float, sl: float, tp
             "min_post_trade_free_margin_pct": MIN_POST_TRADE_FREE_MARGIN_PCT,
         },
     }
+    return result
 
 
 def tool_account(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1249,6 +1399,243 @@ def tool_strategy_delete(args: Dict[str, Any]) -> Dict[str, Any]:
     return {"deleted": existed, "name": name, "count": len(strategies)}
 
 
+# ── New high-impact tools ──
+
+def tool_daily_risk_control(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Persistent daily risk limits. Set max_loss to halt trading after X loss."""
+    action = args.get("action", "status")
+    risk = _load_daily_risk()
+    if action == "set":
+        risk["max_loss"] = abs(float(args.get("max_loss", 0.0)))
+        risk["max_trades"] = abs(int(args.get("max_trades", 0)))
+        risk["date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        risk["trades_today"] = 0
+        _save_daily_risk(risk)
+        return {"action": "set", "max_loss": risk["max_loss"], "max_trades": risk["max_trades"]}
+    if action == "clear":
+        risk["max_loss"] = 0.0
+        risk["max_trades"] = 0
+        _save_daily_risk(risk)
+        return {"action": "cleared"}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_pnl = 0.0
+    try:
+        today_ts = int(datetime.strptime(today + " 00:00:00", "%Y-%m-%d %H:%M:%S").timestamp())
+        hist = _mt5_direct({"action": "history", "from": today_ts, "to": int(time.time()) + 86400})
+        for d in hist.get("deals", hist.get("data", [])):
+            if isinstance(d, dict):
+                today_pnl += d.get("profit", 0.0) + d.get("swap", 0.0) + d.get("commission", 0.0)
+    except Exception:
+        pass
+    try:
+        for p in _mt5_direct({"action": "positions"}).get("positions", []):
+            today_pnl += p.get("profit", 0.0)
+    except Exception:
+        pass
+    blocked = risk.get("max_loss", 0) > 0 and today_pnl <= -risk["max_loss"]
+    return {
+        "action": "status", "max_loss": risk.get("max_loss", 0), "max_trades": risk.get("max_trades", 0),
+        "trades_today": risk.get("trades_today", 0), "today_pnl": round(today_pnl, 2),
+        "blocked": blocked, "date": today,
+    }
+
+
+def tool_pending_modify(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Modify SL/TP of a pending order (cancel + replace)."""
+    if not bool(args.get("confirm_live", False)):
+        return {"executed": False, "needs_confirm_live": True}
+    ticket = int(args["ticket"])
+    try:
+        orders = _mt5_direct({"action": "orders"})
+    except Exception:
+        orders = _mt5_direct({"action": "pending_orders"})
+    target = None
+    for o in orders.get("orders", orders.get("data", [])):
+        if isinstance(o, dict) and o.get("ticket") == ticket:
+            target = o
+            break
+    if not target:
+        return {"executed": False, "error": f"pending order {ticket} not found"}
+    sl = target.get("sl", target.get("stop_loss", 0.0))
+    tp = target.get("tp", target.get("take_profit", 0.0))
+    new_sl = float(args.get("stop_loss", args.get("sl", sl)) if args.get("stop_loss", args.get("sl", "")) != "" else 0.0)
+    new_tp = float(args.get("take_profit", args.get("tp", tp)) if args.get("take_profit", args.get("tp", "")) != "" else 0.0)
+    # Cancel + replace
+    cancel = _mt5_direct({"action": "cancel_pending_order", "ticket": ticket})
+    if not cancel.get("success", cancel.get("executed", False)):
+        return {"executed": False, "error": f"cancel failed: {cancel.get('error', 'unknown')}", "cancel": cancel}
+    replace = _mt5_direct({
+        "action": "send_pending_order", "symbol": target.get("symbol"),
+        "type": "BUY_LIMIT" if target.get("type", 0) in (2, "BUY_LIMIT") else "SELL_LIMIT",
+        "volume": target.get("volume", target.get("lots", 0.01)),
+        "price": target.get("price", target.get("open_price", 0.0)),
+        "stop_loss": new_sl, "take_profit": new_tp,
+    })
+    return {"executed": bool(replace.get("success")), "new_ticket": replace.get("ticket"),
+            "old_ticket": ticket, "sl": new_sl, "tp": new_tp, "result": replace}
+
+
+def tool_scale_in(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Add to a winning position (pyramiding). Checks position is profitable first."""
+    if not bool(args.get("confirm_live", False)):
+        return {"executed": False, "needs_confirm_live": True}
+    ticket = int(args.get("ticket", 0))
+    if ticket:
+        positions = _mt5_direct({"action": "positions"})
+        target = None
+        for p in positions.get("positions", []):
+            if p["ticket"] == ticket:
+                target = p
+                break
+        if not target:
+            return {"executed": False, "error": f"position {ticket} not found"}
+        if target.get("profit", 0) <= 0:
+            return {"executed": False, "error": "position not profitable", "profit": target.get("profit", 0)}
+        symbol = target["symbol"]
+        order_type = "BUY" if target.get("type") in (0, "POSITION_TYPE_BUY") else "SELL"
+    else:
+        symbol = args.get("symbol", "")
+        order_type = args.get("type", "BUY").upper()
+        if not symbol:
+            return {"executed": False, "error": "ticket or symbol+type required"}
+    volume = float(args.get("volume", 0.01))
+    entry = target.get("open_price", 0.0) if ticket else 0.0
+    sl = float(args.get("stop_loss", 0.0))
+    tp = float(args.get("take_profit", 0.0))
+    guard = _guard_live_order(order_type, symbol, volume, sl, tp)
+    if not guard.get("allowed", False):
+        return {"executed": False, "blocked": True, "guard": guard}
+    result = _mt5_direct({
+        "action": "send_order", "symbol": _fix_sym(symbol),
+        "type": order_type, "volume": volume,
+        "stop_loss": sl, "take_profit": tp, "comment": "mcp_scale_in",
+    })
+    return {"executed": bool(result.get("success")), "ticket": result.get("ticket"),
+            "symbol": symbol, "type": order_type, "volume": volume, "entry": entry, "result": result}
+
+
+def tool_netting_summary(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Net position exposure per symbol. Shows aggregated direction, volume, PnL."""
+    positions = _mt5_direct({"action": "positions"})
+    pos_list = positions.get("positions", [])
+    net = {}
+    for p in pos_list:
+        sym = p.get("symbol", "?")
+        if sym not in net:
+            net[sym] = {"symbol": sym, "buy_volume": 0.0, "sell_volume": 0.0,
+                        "buy_pnl": 0.0, "sell_pnl": 0.0, "count": 0}
+        lots = p.get("volume", p.get("lots", 0.0))
+        pnl = p.get("profit", 0.0)
+        net[sym]["count"] += 1
+        if p.get("type") in (0, "POSITION_TYPE_BUY"):
+            net[sym]["buy_volume"] += lots
+            net[sym]["buy_pnl"] += pnl
+        else:
+            net[sym]["sell_volume"] += lots
+            net[sym]["sell_pnl"] += pnl
+    for sym, info in net.items():
+        vol = info["buy_volume"] - info["sell_volume"]
+        info["net_volume"] = round(vol, 2)
+        info["net_direction"] = "BUY" if vol > 0 else ("SELL" if vol < 0 else "FLAT")
+        info["total_pnl"] = round(info["buy_pnl"] + info["sell_pnl"], 2)
+    port_pnl = sum(info["total_pnl"] for info in net.values())
+    return {"symbols": list(net.values()), "position_count": len(pos_list),
+            "total_floating_pnl": round(port_pnl, 2), "symbol_count": len(net)}
+
+
+def tool_mt4_modify(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Modify SL/TP on MT4 position via file bridge."""
+    if not bool(args.get("confirm_live", False)):
+        return {"executed": False, "needs_confirm_live": True}
+    ticket = int(args["ticket"])
+    sl = float(args.get("stop_loss", 0.0))
+    tp = float(args.get("take_profit", 0.0))
+    raw = _send_file_bridge("mt4", f"MODIFY|{ticket}|{sl}|{tp}", timeout=10.0)
+    return {"executed": raw.startswith("OK|"), "ticket": ticket, "sl": sl, "tp": tp, "raw": raw}
+
+
+def tool_mt4_cancel_pending(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Delete pending order on MT4 via file bridge."""
+    if not bool(args.get("confirm_live", False)):
+        return {"executed": False, "needs_confirm_live": True}
+    ticket = int(args["ticket"])
+    raw = _send_file_bridge("mt4", f"DELETE|{ticket}", timeout=10.0)
+    return {"executed": raw.startswith("OK|"), "ticket": ticket, "raw": raw}
+
+
+def tool_mt4_close_symbol(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Close all MT4 positions for a symbol via file bridge."""
+    if not bool(args.get("confirm_live", False)):
+        return {"executed": False, "needs_confirm_live": True}
+    symbol = args["symbol"]
+    raw = _send_file_bridge("mt4", f"CLOSE|{symbol}", timeout=10.0)
+    return {"executed": raw.startswith("OK|"), "symbol": symbol, "raw": raw}
+
+
+def tool_pretrade_check(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Pre-trade battlefield scan. Runs ALL guards + intelligence before trading.
+    One call gives the AI the complete picture: market conditions, risk, opportunity."""
+    symbol = args.get("symbol", "EURUSD")
+    sym = _fix_sym(symbol)
+    order_type = args.get("type", "BUY").upper()
+    volume = float(args.get("volume", 0.01))
+    sl = float(args.get("stop_loss", 0.0))
+    tp = float(args.get("take_profit", 0.0))
+    results = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+
+    results["guard"] = _guard_live_order(order_type, symbol, volume, sl, tp)
+
+    intel_results = {}
+    intel_names = ["conviction_decide", "market_sessions", "news_check", "regime_detect",
+                   "anomaly_detect", "ensemble_vote", "market_trend_structure",
+                   "market_swing_levels", "market_fair_value_gaps", "correlation_report",
+                   "antimanipulation_analyze", "sr_levels", "analytics_report",
+                   "volume_profile", "autoswitch_status"]
+    for iname in intel_names:
+        try:
+            if iname in _intelligence_tools:
+                fn = _intelligence_tools[iname][0]
+                needs_sym = iname in ("trend_structure", "market_trend_structure", "market_swing_levels",
+                                      "market_fair_value_gaps", "sr_levels", "volume_profile",
+                                      "regime_detect", "anomaly_detect", "conviction_decide",
+                                      "ensemble_vote", "antimanipulation_analyze")
+                intel_results[iname] = fn({"symbol": symbol}) if needs_sym else fn({})
+        except Exception as e:
+            intel_results[iname] = f"error: {e}"
+    results["intelligence"] = intel_results
+
+    guard = results["guard"]
+    allowed = guard.get("allowed", False)
+    verdicts = []
+    if allowed:
+        verdicts.append("APPROVED")
+    else:
+        verdicts.extend(guard.get("reasons", ["blocked"]))
+    conv = intel_results.get("conviction_decide", {})
+    if isinstance(conv, dict):
+        d = conv.get("decision", conv)
+        conf = d.get("confidence_pct", d.get("score", 0))
+        dir_signal = d.get("verdict", d.get("direction", ""))
+        verdicts.append(f"conviction={conf}% ({dir_signal})")
+    reg = intel_results.get("regime_detect", {})
+    if isinstance(reg, dict):
+        verdicts.append(f"regime={reg.get('regime','?')}")
+    ses = intel_results.get("market_sessions", {})
+    if isinstance(ses, dict):
+        verdicts.append(f"session={ses.get('advice','?')} (quality={ses.get('quality',0):.0%})")
+    anom = intel_results.get("anomaly_detect", {})
+    if isinstance(anom, dict):
+        ascore = anom.get("score", 0)
+        if ascore > 0.5:
+            verdicts.append(f"anomaly={ascore:.2f}")
+    news = intel_results.get("news_check", {})
+    if isinstance(news, dict) and news.get("has_event"):
+        verdicts.append("news-nearby")
+    results["summary"] = " | ".join(verdicts)
+    results["tradeable"] = allowed
+    return results
+
+
 def schema(props: Dict[str, Any], required: Optional[List[str]] = None) -> Dict[str, Any]:
     return {"type": "object", "properties": props, "required": required or []}
 
@@ -1469,6 +1856,48 @@ TOOLS: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], str, Dict[str
         "max_spread_points": {"type": "integer", "default": 80},
         "dry_run": {"type": "boolean", "default": True},
         "confirm_live": {"type": "boolean", "default": False},
+    })),
+    "mt5_daily_risk_control": (tool_daily_risk_control, "Control de riesgo diario: set/clear/status. Si max_loss se excede, bloquea trades.", schema({
+        "action": {"type": "string", "enum": ["status", "set", "clear"], "default": "status"},
+        "max_loss": {"type": "number", "default": 0},
+        "max_trades": {"type": "integer", "default": 0},
+    })),
+    "mt5_pending_modify": (tool_pending_modify, "Modifica SL/TP de una orden pendiente (cancel + replace).", schema({
+        "ticket": {"type": "integer"},
+        "stop_loss": {"type": "number", "default": 0},
+        "take_profit": {"type": "number", "default": 0},
+        "confirm_live": {"type": "boolean", "default": False},
+    }, ["ticket"])),
+    "mt5_scale_in": (tool_scale_in, "Añade volumen a una posición ganadora (pyramiding). Verifica que esté en profit.", schema({
+        "ticket": {"type": "integer", "default": 0},
+        "symbol": {"type": "string", "default": ""},
+        "type": {"type": "string", "enum": ["BUY", "SELL"], "default": "BUY"},
+        "volume": {"type": "number", "default": 0.01},
+        "stop_loss": {"type": "number", "default": 0},
+        "take_profit": {"type": "number", "default": 0},
+        "confirm_live": {"type": "boolean", "default": False},
+    })),
+    "mt5_netting_summary": (tool_netting_summary, "Resumen de exposición neta por símbolo: volumen neto, PnL agregado.", schema({})),
+    "mt4_modify_position": (tool_mt4_modify, "Modifica SL/TP de una posición en MT4.", schema({
+        "ticket": {"type": "integer"},
+        "stop_loss": {"type": "number", "default": 0},
+        "take_profit": {"type": "number", "default": 0},
+        "confirm_live": {"type": "boolean", "default": False},
+    }, ["ticket"])),
+    "mt4_cancel_pending_order": (tool_mt4_cancel_pending, "Cancela una orden pendiente en MT4.", schema({
+        "ticket": {"type": "integer"},
+        "confirm_live": {"type": "boolean", "default": False},
+    }, ["ticket"])),
+    "mt4_close_symbol": (tool_mt4_close_symbol, "Cierra todas las posiciones de un símbolo en MT4.", schema({
+        "symbol": {"type": "string"},
+        "confirm_live": {"type": "boolean", "default": False},
+    }, ["symbol"])),
+    "mt5_pretrade_check": (tool_pretrade_check, "Pre-trade battlefield scan. ALL guards + intelligence en 1 llamada. Úsala antes de cada trade.", schema({
+        "symbol": {"type": "string", "default": "EURUSD"},
+        "type": {"type": "string", "enum": ["BUY", "SELL"], "default": "BUY"},
+        "volume": {"type": "number", "default": 0.01},
+        "stop_loss": {"type": "number", "default": 0},
+        "take_profit": {"type": "number", "default": 0},
     })),
 }
 

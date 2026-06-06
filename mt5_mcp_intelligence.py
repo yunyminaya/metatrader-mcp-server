@@ -849,6 +849,126 @@ T("ensemble_vote", lambda args: ensemble_vote(_mt5_direct, args.get("symbol","EU
 T("edge_calculate", lambda args: edge_calculate(args.get("strategy","conviction"), args.get("symbol","EURUSD"), args.get("direction","BUY")),
   "Expected Value + Kelly from historical similar setups. Only trade if EV > 0.", {"strategy":{"type":"string"},"symbol":{"type":"string"},"direction":{"type":"string"}}, ["strategy","symbol","direction"])
 
+# ── Market Structure Tools ──
+
+def swing_levels(mt5_direct_fn, symbol="EURUSD", lookback=100):
+    """Detect swing highs and lows. Returns key support/resistance levels."""
+    try:
+        raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": "H1", "count": lookback})
+        candles = raw.get("candles", raw.get("data", []))
+    except Exception:
+        try:
+            raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": "H1", "count": lookback})
+            candles = raw.get("candles", [])
+        except Exception:
+            return {"swing_highs": [], "swing_lows": [], "error": "no data"}
+    if not candles:
+        return {"swing_highs": [], "swing_lows": []}
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    swing_highs = []
+    swing_lows = []
+    for i in range(2, len(highs) - 2):
+        if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+            swing_highs.append({"price": highs[i], "index": i})
+        if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+            swing_lows.append({"price": lows[i], "index": i})
+    return {"swing_highs": swing_highs[-10:] if len(swing_highs) > 10 else swing_highs,
+            "swing_lows": swing_lows[-10:] if len(swing_lows) > 10 else swing_lows}
+
+
+def order_blocks(mt5_direct_fn, symbol="EURUSD", lookback=60):
+    """Detect bullish/bearish order blocks from last 60 candles."""
+    try:
+        raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": "H1", "count": lookback})
+        candles = raw.get("candles", raw.get("data", []))
+    except Exception:
+        return {"bullish_blocks": [], "bearish_blocks": []}
+    if not candles:
+        return {"bullish_blocks": [], "bearish_blocks": []}
+    bullish = []
+    bearish = []
+    for i in range(1, len(candles)):
+        prev, cur = candles[i-1], candles[i]
+        # Bullish order block: red candle followed by green that breaks above prev high
+        if prev["close"] < prev["open"] and cur["close"] > cur["open"] and cur["high"] > prev["high"]:
+            bullish.append({"price_range": [prev["open"], prev["close"]], "index": i, "strength": "strong" if cur["close"] > prev["high"] + (prev["high"] - prev["low"]) * 0.5 else "weak"})
+        # Bearish order block: green candle followed by red that breaks below prev low
+        if prev["close"] > prev["open"] and cur["close"] < cur["open"] and cur["low"] < prev["low"]:
+            bearish.append({"price_range": [prev["open"], prev["close"]], "index": i, "strength": "strong" if cur["close"] < prev["low"] - (prev["high"] - prev["low"]) * 0.5 else "weak"})
+    # Reduce to readable count
+    return {"bullish_blocks": bullish[-5:] if len(bullish) > 5 else bullish,
+            "bearish_blocks": bearish[-5:] if len(bearish) > 5 else bearish}
+
+
+def fair_value_gaps(mt5_direct_fn, symbol="EURUSD", lookback=40):
+    """Detect fair value gaps (FVG) from last 40 candles."""
+    try:
+        raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": "H1", "count": lookback})
+        candles = raw.get("candles", raw.get("data", []))
+    except Exception:
+        return {"gaps": []}
+    gaps = []
+    for i in range(2, len(candles)):
+        c1, c2, c3 = candles[i-2], candles[i-1], candles[i]
+        # Bullish FVG: c3 low > c1 high (gap up)
+        if c3["low"] > c1["high"]:
+            gaps.append({"type": "bullish", "gap_high": c3["low"], "gap_low": c1["high"],
+                         "mid": round((c3["low"] + c1["high"]) / 2, 5), "index": i})
+        # Bearish FVG: c3 high < c1 low (gap down)
+        elif c3["high"] < c1["low"]:
+            gaps.append({"type": "bearish", "gap_high": c1["low"], "gap_low": c3["high"],
+                         "mid": round((c1["low"] + c3["high"]) / 2, 5), "index": i})
+    return {"gaps": gaps[-5:] if len(gaps) > 5 else gaps}
+
+
+def trend_structure(mt5_direct_fn, symbol="EURUSD"):
+    """Multi-timeframe trend: D1 → H4 → H1 alignment."""
+    try:
+        d1_raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": "D1", "count": 30})
+        h4_raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": "H4", "count": 30})
+        h1_raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": "H1", "count": 30})
+        d1 = d1_raw.get("candles", d1_raw.get("data", []))
+        h4 = h4_raw.get("candles", h4_raw.get("data", []))
+        h1 = h1_raw.get("candles", h1_raw.get("data", []))
+    except Exception:
+        return {"trend": "unknown"}
+    if not d1 or not h4 or not h1:
+        return {"trend": "unknown"}
+
+    def trend_dir(candles):
+        if len(candles) < 10:
+            return "flat"
+        ema_fast = sum(c["close"] for c in candles[-5:]) / 5
+        ema_slow = sum(c["close"] for c in candles[-10:]) / 10
+        higher_highs = candles[-1]["high"] > candles[-3]["high"] > candles[-5]["high"]
+        higher_lows = candles[-2]["low"] > candles[-4]["low"] > candles[-6]["low"]
+        if ema_fast > ema_slow and higher_highs and higher_lows:
+            return "uptrend"
+        elif ema_fast < ema_slow and candles[-1]["low"] < candles[-3]["low"] < candles[-5]["low"]:
+            return "downtrend"
+        return "ranging"
+
+    d1_trend = trend_dir(d1)
+    h4_trend = trend_dir(h4)
+    h1_trend = trend_dir(h1)
+    aligned = d1_trend == h4_trend == h1_trend and d1_trend in ("uptrend", "downtrend")
+    return {"d1": d1_trend, "h4": h4_trend, "h1": h1_trend,
+            "aligned": aligned, "bias": d1_trend if aligned else "misaligned"}
+
+
+T("market_swing_levels", lambda args: swing_levels(_mt5_direct, args.get("symbol", "EURUSD"), int(args.get("lookback", 100))),
+  "Swing highs/lows for support/resistance.", {"symbol": {"type": "string", "default": "EURUSD"}, "lookback": {"type": "integer", "default": 100}})
+
+T("market_order_blocks", lambda args: order_blocks(_mt5_direct, args.get("symbol", "EURUSD"), int(args.get("lookback", 60))),
+  "Bullish/bearish order blocks. Price tends to react at these zones.", {"symbol": {"type": "string", "default": "EURUSD"}, "lookback": {"type": "integer", "default": 60}})
+
+T("market_fair_value_gaps", lambda args: fair_value_gaps(_mt5_direct, args.get("symbol", "EURUSD"), int(args.get("lookback", 40))),
+  "Fair value gaps (FVG). Price often retraces to fill these.", {"symbol": {"type": "string", "default": "EURUSD"}, "lookback": {"type": "integer", "default": 40}})
+
+T("market_trend_structure", lambda args: trend_structure(_mt5_direct, args.get("symbol", "EURUSD")),
+  "Multi-timeframe trend: D1 → H4 → H1 alignment. Only trade when aligned.", {"symbol": {"type": "string", "default": "EURUSD"}})
+
 # Need _mt5_direct reference from the main server
 _mt5_direct = None
 
