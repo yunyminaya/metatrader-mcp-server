@@ -375,12 +375,13 @@ def _parse_check(raw: str) -> Dict[str, Any]:
 
 
 def _guard_live_order(order_type: str, symbol: str, volume: float, sl: float, tp: float) -> Dict[str, Any]:
+    sym = _fix_sym(symbol)
     account = _mt5_direct({"action": "account"})
-    price = _mt5_direct({"action": "price", "symbol": symbol})
+    price = _mt5_direct({"action": "price", "symbol": sym})
     positions = _mt5_direct({"action": "positions"})
     check = _mt5_direct({
         "action": "check_order",
-        "symbol": symbol,
+        "symbol": sym,
         "type": order_type.upper(),
         "volume": volume,
         "stop_loss": sl,
@@ -1014,6 +1015,230 @@ def tool_auto_trade(args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _pip_info(symbol):
+    """Get pip size and digit info for a symbol."""
+    try:
+        p = _mt5_direct({"action": "price", "symbol": _fix_sym(symbol)})
+        digits = p.get("digits", 5)
+        point = p.get("point", 0.00001)
+        pip_size = 0.01 if "JPY" in symbol.upper() else 0.0001
+        return pip_size, digits, point, p.get("bid", 0), p.get("ask", 0)
+    except Exception:
+        return 0.0001, 5, 0.00001, 0, 0
+
+
+def tool_quick_buy(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Compra rápida con SL/TP en pips. Un solo comando."""
+    symbol = args["symbol"]
+    volume = float(args.get("volume", 0.01))
+    sl_pips = float(args.get("sl_pips", 0))
+    tp_pips = float(args.get("tp_pips", 0))
+    confirm_live = bool(args.get("confirm_live", False))
+    dry_run = not confirm_live
+
+    pip_size, digits, point, bid, ask = _pip_info(symbol)
+    if ask == 0:
+        return {"executed": False, "error": "no price for symbol"}
+
+    sl = round(ask - sl_pips * pip_size, digits) if sl_pips > 0 else 0.0
+    tp = round(ask + tp_pips * pip_size, digits) if tp_pips > 0 else 0.0
+
+    guard = _guard_live_order("BUY", symbol, volume, sl, tp)
+    if dry_run:
+        return {"executed": False, "dry_run": True, "needs_confirm_live": True,
+                "info": {"symbol": symbol, "type": "BUY", "volume": volume,
+                         "entry": round(ask, digits), "sl": sl, "tp": tp,
+                         "sl_pips": sl_pips, "tp_pips": tp_pips, "spread": guard.get("price",{}).get("spread",0)},
+                "guard": {"allowed": guard.get("allowed"), "reasons": guard.get("reasons", [])}}
+    if not guard.get("allowed"):
+        return {"executed": False, "error": "risk_guard_blocked", "guard": guard}
+
+    result = _mt5_direct({
+        "action": "send_order", "symbol": _fix_sym(symbol),
+        "type": "BUY", "volume": volume, "stop_loss": sl, "take_profit": tp,
+        "comment": "mcp_quick",
+    })
+    return {"executed": bool(result.get("success")), "ticket": result.get("ticket"),
+            "entry": round(ask, digits), "sl": sl, "tp": tp, "result": result}
+
+
+def tool_quick_sell(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Venta rápida con SL/TP en pips. Un solo comando."""
+    symbol = args["symbol"]
+    volume = float(args.get("volume", 0.01))
+    sl_pips = float(args.get("sl_pips", 0))
+    tp_pips = float(args.get("tp_pips", 0))
+    confirm_live = bool(args.get("confirm_live", False))
+    dry_run = not confirm_live
+
+    pip_size, digits, point, bid, ask = _pip_info(symbol)
+    if bid == 0:
+        return {"executed": False, "error": "no price for symbol"}
+
+    sl = round(bid + sl_pips * pip_size, digits) if sl_pips > 0 else 0.0
+    tp = round(bid - tp_pips * pip_size, digits) if tp_pips > 0 else 0.0
+
+    guard = _guard_live_order("SELL", symbol, volume, sl, tp)
+    if dry_run:
+        return {"executed": False, "dry_run": True, "needs_confirm_live": True,
+                "info": {"symbol": symbol, "type": "SELL", "volume": volume,
+                         "entry": round(bid, digits), "sl": sl, "tp": tp,
+                         "sl_pips": sl_pips, "tp_pips": tp_pips, "spread": guard.get("price",{}).get("spread",0)},
+                "guard": {"allowed": guard.get("allowed"), "reasons": guard.get("reasons", [])}}
+    if not guard.get("allowed"):
+        return {"executed": False, "error": "risk_guard_blocked", "guard": guard}
+
+    result = _mt5_direct({
+        "action": "send_order", "symbol": _fix_sym(symbol),
+        "type": "SELL", "volume": volume, "stop_loss": sl, "take_profit": tp,
+        "comment": "mcp_quick",
+    })
+    return {"executed": bool(result.get("success")), "ticket": result.get("ticket"),
+            "entry": round(bid, digits), "sl": sl, "tp": tp, "result": result}
+
+
+def tool_move_to_breakeven(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Mueve SL de una posición a precio de entrada."""
+    if not bool(args.get("confirm_live", False)):
+        return {"executed": False, "needs_confirm_live": True}
+    ticket = int(args["ticket"])
+    pos = _mt5_direct({"action": "positions"})
+    target = None
+    for p in pos.get("positions", []):
+        if p["ticket"] == ticket:
+            target = p
+            break
+    if not target:
+        return {"executed": False, "error": "position not found"}
+    res = _mt5_direct({"action": "modify_position", "ticket": ticket,
+                       "stop_loss": target["open_price"],
+                       "take_profit": target.get("take_profit", "")})
+    return {"executed": bool(res.get("success")), "ticket": ticket,
+            "breakeven_price": target["open_price"], "result": res}
+
+
+def tool_trail_all(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Aplica trailing stop a todas las posiciones abiertas."""
+    if not bool(args.get("confirm_live", False)):
+        return {"executed": False, "needs_confirm_live": True}
+    activation_pips = float(args.get("activation_pips", 15))
+    distance_pips = float(args.get("distance_pips", 10))
+    positions = _mt5_direct({"action": "positions"})
+    results = []
+    for p in positions.get("positions", []):
+        sym = p["symbol"]
+        pip_size = 0.01 if "JPY" in sym.upper() else 0.0001
+        bid_ask = _mt5_direct({"action": "price", "symbol": sym})
+        bid = bid_ask.get("bid", 0)
+        ask = bid_ask.get("ask", 0)
+        profit_pips = (bid - p["open_price"]) / pip_size if p["type"] == "BUY" else (p["open_price"] - ask) / pip_size
+        if profit_pips >= activation_pips and profit_pips > 0:
+            new_sl = bid - distance_pips * pip_size if p["type"] == "BUY" else ask + distance_pips * pip_size
+            digits = bid_ask.get("digits", 5)
+            new_sl = round(new_sl, digits)
+            if (p["type"] == "BUY" and new_sl > p.get("stop_loss", 0)) or \
+               (p["type"] == "SELL" and (new_sl < p.get("stop_loss", 0) or p.get("stop_loss", 0) == 0)):
+                res = _mt5_direct({"action": "modify_position", "ticket": p["ticket"],
+                                   "stop_loss": new_sl, "take_profit": p.get("take_profit", "")})
+                results.append({"ticket": p["ticket"], "symbol": sym, "new_sl": new_sl,
+                                "profit_pips": round(profit_pips, 1), "success": bool(res.get("success"))})
+    return {"trailed": len(results), "results": results}
+
+
+def tool_account_summary(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Resumen completo de la cuenta en lenguaje humano."""
+    acct = _mt5_direct({"action": "account"})
+    pos = _mt5_direct({"action": "positions"})
+    total_pnl = float(pos.get("total_profit", 0) or 0)
+    open_count = len(pos.get("positions", []))
+    balance = float(acct.get("balance", 0))
+    equity = float(acct.get("equity", 0))
+    free = float(acct.get("margin_free", acct.get("free_margin", 0)) or 0)
+    floating = equity - balance
+    daily_pnl = 0
+    try:
+        hist = _mt5_direct({"action": "history", "days": 1})
+        daily_pnl = sum(float(d.get("profit", 0)) for d in hist.get("deals", []))
+    except Exception:
+        pass
+    return {
+        "balance": round(balance, 2), "equity": round(equity, 2),
+        "margin_free": round(free, 2), "margin_used": round(balance - free, 2),
+        "floating_pnl": round(floating, 2), "daily_pnl": round(daily_pnl, 2),
+        "open_positions": open_count, "total_open_pnl": round(total_pnl, 2),
+        "health": "good" if equity >= balance * 0.95 else ("warning" if equity >= balance * 0.9 else "critical"),
+        "currency": acct.get("currency", "USD"),
+        "server": acct.get("server", ""),
+    }
+
+
+def tool_best_time_to_trade(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Mejor horario para operar cada par según sesiones."""
+    from datetime import datetime, timezone
+    h = datetime.now(timezone.utc).hour
+    pairs = {
+        "EURUSD": {"best": "london_ny 12-16", "quality": "high"},
+        "GBPUSD": {"best": "london 7-16", "quality": "high"},
+        "USDJPY": {"best": "asian 0-9 / london 7-16", "quality": "medium"},
+        "USDCAD": {"best": "newyork 12-21", "quality": "medium"},
+        "AUDUSD": {"best": "asian 0-9 / london 7-16", "quality": "medium"},
+        "NZDUSD": {"best": "asian 0-9", "quality": "medium"},
+        "EURJPY": {"best": "london 7-16 / asian 0-9", "quality": "medium"},
+        "GBPJPY": {"best": "london 7-16", "quality": "medium"},
+    }
+    sym = args.get("symbol", "EURUSD").upper()
+    info = pairs.get(sym, {"best": "london/ny", "quality": "medium"})
+    session = "london_ny" if 12 <= h < 16 else ("london" if 7 <= h < 16 else ("ny" if 12 <= h < 21 else ("asian" if 0 <= h < 9 else "off")))
+    good_time = session in info.get("best", "")
+    return {"symbol": sym, "current_session": session, "best_session": info["best"],
+            "recommended": good_time, "advice": "trade now" if good_time else "wait for better session",
+            "current_hour_utc": h}
+
+
+def tool_market_overview(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Vista rápida de todos los pares mayores en una llamada."""
+    majors = ["EURUSD", "GBPUSD", "USDJPY", "USDCAD", "USDCHF", "AUDUSD", "NZDUSD"]
+    pairs = []
+    buy_signals = 0
+    sell_signals = 0
+    for sym in majors:
+        try:
+            p = _mt5_direct({"action": "price", "symbol": _fix_sym(sym)})
+            bid = p.get("bid", 0)
+            ask = p.get("ask", 0)
+            spread = p.get("spread", 0)
+            pip_size = 0.01 if "JPY" in sym else 0.0001
+            spread_pips = round(spread * p.get("point", 0.00001) / pip_size, 1)
+            pairs.append({
+                "symbol": sym, "bid": bid, "ask": ask,
+                "spread_pts": spread, "spread_pips": spread_pips,
+                "tradeable": spread_pips < 8.0,
+            })
+        except Exception:
+            pairs.append({"symbol": sym, "error": True})
+    return {"pairs": pairs, "total": len(majors),
+            "scanned_at": datetime.now(timezone.utc).isoformat()}
+
+
+def tool_pip_value(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Calcula el valor monetario de 1 pip para un símbolo y volumen."""
+    symbol = args["symbol"]
+    volume = float(args.get("volume", 0.01))
+    try:
+        info = _mt5_direct({"action": "symbol_info", "symbol": _fix_sym(symbol)})
+        tick_value = float(info.get("trade_tick_value", 0) or 0)
+        tick_size = float(info.get("trade_tick_size", 0) or 0)
+        pip_size = 0.01 if "JPY" in symbol.upper() else 0.0001
+        if tick_size > 0 and tick_value > 0:
+            pip_value = (pip_size / tick_size) * tick_value * volume
+        else:
+            pip_value = volume * 10 if "USD" in symbol.upper() else volume * 10 * 1.15
+        return {"symbol": symbol, "volume": volume, "pip_size": pip_size,
+                "pip_value": round(pip_value, 4), "currency": "USD"}
+    except Exception as e:
+        return {"symbol": symbol, "volume": volume, "pip_value": volume * 10, "estimated": True, "note": str(e)[:50]}
+
+
 def tool_strategy_delete(args: Dict[str, Any]) -> Dict[str, Any]:
     name = str(args["name"]).strip()
     strategies = _load_strategies()
@@ -1205,6 +1430,38 @@ TOOLS: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], str, Dict[str
         "volume": {"type": "number", "default": 0.01},
         "limit": {"type": "integer", "default": 5},
     })),
+    "mt5_quick_buy": (tool_quick_buy, "Compra rápida con SL/TP en pips. Un solo comando fácil.", schema({
+        "symbol": {"type": "string"},
+        "volume": {"type": "number", "default": 0.01},
+        "sl_pips": {"type": "number", "default": 0},
+        "tp_pips": {"type": "number", "default": 0},
+        "confirm_live": {"type": "boolean", "default": False},
+    }, ["symbol"])),
+    "mt5_quick_sell": (tool_quick_sell, "Venta rápida con SL/TP en pips. Un solo comando fácil.", schema({
+        "symbol": {"type": "string"},
+        "volume": {"type": "number", "default": 0.01},
+        "sl_pips": {"type": "number", "default": 0},
+        "tp_pips": {"type": "number", "default": 0},
+        "confirm_live": {"type": "boolean", "default": False},
+    }, ["symbol"])),
+    "mt5_move_to_breakeven": (tool_move_to_breakeven, "Mueve SL de una posición a precio de entrada.", schema({
+        "ticket": {"type": "integer"},
+        "confirm_live": {"type": "boolean", "default": False},
+    }, ["ticket"])),
+    "mt5_trail_all": (tool_trail_all, "Aplica trailing stop automático a todas las posiciones.", schema({
+        "activation_pips": {"type": "number", "default": 15},
+        "distance_pips": {"type": "number", "default": 10},
+        "confirm_live": {"type": "boolean", "default": False},
+    })),
+    "mt5_account_summary": (tool_account_summary, "Resumen completo: balance, equity, PnL flotante, diario, posiciones abiertas.", schema({})),
+    "mt5_best_time_to_trade": (tool_best_time_to_trade, "Mejor horario para operar un par según sesiones.", schema({
+        "symbol": {"type": "string", "default": "EURUSD"},
+    })),
+    "mt5_market_overview": (tool_market_overview, "Vista rápida de todos los pares mayores: bid/ask/spread/tradeable.", schema({})),
+    "mt5_pip_value": (tool_pip_value, "Valor monetario de 1 pip para un símbolo y volumen.", schema({
+        "symbol": {"type": "string"},
+        "volume": {"type": "number", "default": 0.01},
+    }, ["symbol"])),
     "mt5_auto_trade": (tool_auto_trade, "ONE-SHOT: escanea, decide, verifica guardias + ejecuta el mejor trade. Sistema completo en un comando.", schema({
         "symbols": {"type": "array", "items": {"type": "string"}, "default": ["EURUSD","GBPUSD","USDJPY","USDCAD","AUDUSD"]},
         "volume": {"type": "number", "default": 0.01},
