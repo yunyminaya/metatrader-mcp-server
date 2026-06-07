@@ -639,6 +639,64 @@ def handle(cmd):
             except Exception as e:
                 results.append({"error": str(e), "cmd": subcmd})
         return {"results": results, "count": len(results)}
+    if action == "live_ticks":
+        symbol = cmd.get("symbol", "EURUSD.FX")
+        count = int(cmd.get("count", 50))
+        try:
+            ticks = mt5.copy_ticks_from(symbol, datetime.now() - timedelta(minutes=5), count)
+            if ticks is None or len(ticks) == 0:
+                return {"symbol": symbol, "ticks": [], "count": 0}
+            result = []
+            for t in ticks[-count:]:
+                result.append({
+                    "time": int(t[0]) if hasattr(t, '__getitem__') else int(t.time),
+                    "bid": float(t[1]) if hasattr(t, '__getitem__') else t.bid,
+                    "ask": float(t[2]) if hasattr(t, '__getitem__') else t.ask,
+                    "last": float(t[3]) if hasattr(t, '__getitem__') else t.last,
+                    "volume": float(t[4]) if hasattr(t, '__getitem__') else t.volume,
+                    "flags": int(t[5]) if hasattr(t, '__getitem__') else t.flags,
+                })
+            return {"symbol": symbol, "ticks": result, "count": len(result)}
+        except Exception as e:
+            return {"error": f"copy_ticks failed: {e}"}
+    if action == "realtime_snapshot":
+        """Snapshot of everything happening now: ticks, positions, orders, deals, account."""
+        symbol = cmd.get("symbol", "EURUSD.FX")
+        snapshot = {}
+        try:
+            acct = account()
+            snapshot["account"] = acct
+        except:
+            snapshot["account"] = {"error": "failed"}
+        try:
+            pos = positions(cmd)
+            snapshot["positions"] = pos
+        except:
+            snapshot["positions"] = {"error": "failed"}
+        try:
+            ords = orders(cmd)
+            snapshot["orders"] = ords
+        except:
+            snapshot["orders"] = {"error": "failed"}
+        try:
+            ticks_live = mt5.copy_ticks_from(symbol, datetime.now() - timedelta(seconds=30), 100)
+            t_result = []
+            if ticks_live is not None and len(ticks_live) > 0:
+                for t in ticks_live[-30:]:
+                    try:
+                        t_result.append({"time": int(t.time), "bid": t.bid, "ask": t.ask, "last": t.last, "vol": t.volume, "flags": t.flags})
+                    except:
+                        pass
+            snapshot["ticks_30s"] = {"symbol": symbol, "count": len(t_result), "ticks": t_result[-10:]}
+        except:
+            snapshot["ticks_30s"] = {"error": "ticks failed"}
+        try:
+            history_cmd = dict(cmd)
+            history_cmd["days"] = 0.04  # ~1 hour
+            snapshot["history_1h"] = history(history_cmd)
+        except:
+            snapshot["history_1h"] = {"error": "history failed"}
+        return snapshot
     return {"error": f"unknown action: {action}"}
 
 

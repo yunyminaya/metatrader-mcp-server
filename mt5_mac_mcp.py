@@ -2258,6 +2258,41 @@ def _backtest_quick(candles, strategy="ma_cross"):
         "net_pnl": round(balance - 100, 2),
     }
 
+# ── Live Market Monitor ──
+
+def tool_live_monitor(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Snapshot de TODO lo que está pasando AHORA: ticks en vivo, posiciones, órdenes, deals recientes, cuenta."""
+    symbol = args.get("symbol", "EURUSD")
+    sym = _fix_sym(symbol)
+    try:
+        return _mt5_direct({"action": "realtime_snapshot", "symbol": sym}, timeout=30.0)
+    except Exception as e:
+        return {"error": str(e)}
+
+def tool_live_ticks(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Stream de ticks en vivo del símbolo. Últimos N ticks."""
+    symbol = args.get("symbol", "EURUSD")
+    sym = _fix_sym(symbol)
+    count = int(args.get("count", 50))
+    try:
+        return _mt5_direct({"action": "live_ticks", "symbol": sym, "count": count}, timeout=20.0)
+    except Exception as e:
+        return {"error": str(e)}
+
+def tool_live_prices(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Precios en vivo de todos los pares mayores. Una llamada, todos los datos."""
+    symbols = ["EURUSD","GBPUSD","USDJPY","USDCAD","AUDUSD","NZDUSD","USDCHF","EURGBP","EURJPY"]
+    results = {}
+    for sym in symbols:
+        try:
+            s = _fix_sym(sym)
+            p = _mt5_direct({"action": "price", "symbol": s}, timeout=10.0)
+            results[sym] = {"bid": p.get("bid"), "ask": p.get("ask"), "spread": p.get("spread"), "time": p.get("time")}
+        except:
+            results[sym] = {"error": "failed"}
+    return {"pairs": results, "count": len(results), "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
 BG_STATE_FILE = DATA_DIR / "bg_state.json"
 
 def _read_bg_state():
@@ -2615,6 +2650,14 @@ TOOLS: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], str, Dict[str
     "mt5_bg_start": (tool_bg_start, "START background precompute engine. Prepares everything in advance 24/7.", schema({})),
     "mt5_bg_stop": (tool_bg_stop, "STOP background precompute engine.", schema({})),
     "mt5_bg_status": (tool_bg_status, "Get pre-computed market data. ALL analysis ready instantly — no waiting.", schema({})),
+    "mt5_live_monitor": (tool_live_monitor, "TODO lo que pasa AHORA: ticks en vivo, posiciones, órdenes, deals recientes, cuenta. Una llamada.", schema({
+        "symbol": {"type": "string", "default": "EURUSD"},
+    })),
+    "mt5_live_ticks": (tool_live_ticks, "Stream de ticks en vivo del símbolo. Ve cada movimiento del mercado en tiempo real.", schema({
+        "symbol": {"type": "string", "default": "EURUSD"},
+        "count": {"type": "integer", "default": 50},
+    })),
+    "mt5_live_prices": (tool_live_prices, "Precios en vivo de TODOS los pares mayores en una sola llamada.", schema({})),
 }
 
 # Merge intelligence tools
