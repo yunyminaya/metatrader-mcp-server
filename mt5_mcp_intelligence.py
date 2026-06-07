@@ -3232,6 +3232,106 @@ T("quick_double", lambda args: quick_double(
   "🎯 ESTRATEGIA PARA DUPLICAR: squeeze breakout + compounding ladder. Te dice exactamente donde poner las ordenes para atrapar el breakout y duplicar.",
   {"bankroll":{"type":"number"}})
 
+# ── Anticipation Sniper: Ganar como el Video ─────────────────────────────
+def anticipation_sniper(client, symbol="EURUSD"):
+    """🎬 ESTRATEGIA DEL VIDEO: Market Brain predice 3 movimientos. Entramos cuando el hunt termina.
+       Ellos compran caro — nosotros compramos barato. Ellos venden barato — nosotros vendemos caro.
+       La clave: orden LIMIT en el nivel del hunt, SL justo detras, TP en el movimiento real."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    pip = 0.0001 if "JPY" not in symbol else 0.01
+    price = _price(client, symbol)
+    bid = price.get("bid", 0)
+    ask = price.get("ask", 0)
+    result["current_price"] = {"bid": bid, "ask": ask, "spread": price.get("spread")}
+    
+    # Get Market Brain predictions
+    brain = market_brain(client, symbol)
+    mb = brain.get("market_brain", {})
+    moves = brain.get("predicted_moves", [])
+    result["brain_edge"] = mb.get("edge_score")
+    result["brain_direction"] = mb.get("recommendation", {}).get("action")
+    
+    if len(moves) < 3:
+        result["error"] = "Brain no tiene 3 predicciones"
+        result["action"] = "WAIT"
+        return result
+    
+    # The 3 moves
+    hunt = moves[0]
+    reaction = moves[1]
+    real = moves[2]
+    
+    # Determine entry direction based on real move (move 3)
+    real_dir = real.get("direction", "").lower()
+    hunt_target = hunt.get("target", 0)
+    reaction_target = reaction.get("target", 0)
+    real_target = real.get("target", 0)
+    
+    if real_dir == "up":
+        # Real move is UP → we BUY
+        # Hunt was DOWN → place BUY LIMIT at hunt target
+        entry_price = min(hunt_target, reaction_target) if hunt_target and reaction_target else hunt_target
+        sl_price = entry_price - pip * 3  # 3 pips below entry
+        tp_price = real_target if real_target else entry_price + pip * 10
+        direction = "BUY"
+        reasoning = f"Hunt ↓{hunt_target} → nosotros compramos LIMIT ahí → reacción ↑{reaction_target} → real ↑{real_target}"
+    elif real_dir == "down":
+        # Real move is DOWN → we SELL
+        # Hunt was UP → place SELL LIMIT at hunt target
+        entry_price = max(hunt_target, reaction_target) if hunt_target and reaction_target else hunt_target
+        sl_price = entry_price + pip * 3  # 3 pips above entry
+        tp_price = real_target if real_target else entry_price - pip * 10
+        direction = "SELL"
+        reasoning = f"Hunt ↑{hunt_target} → nosotros vendemos LIMIT ahí → reacción ↓{reaction_target} → real ↓{real_target}"
+    else:
+        result["action"] = "SKIP"
+        result["reasoning"] = "Brain no da direccion clara"
+        return result
+    
+    # Calculate R:R
+    sl_pips = abs(entry_price - sl_price) / pip
+    tp_pips = abs(tp_price - entry_price) / pip
+    rr = round(tp_pips / sl_pips, 1) if sl_pips > 0 else 0
+    
+    result["strategy"] = "ANTICIPATION SNIPER"
+    result["direction"] = direction
+    result["entry"] = round(entry_price, 5)
+    result["sl"] = round(sl_price, 5)
+    result["tp"] = round(tp_price, 5)
+    result["sl_pips"] = round(sl_pips, 1)
+    result["tp_pips"] = round(tp_pips, 1)
+    result["rr_ratio"] = rr
+    result["hunt"] = {"move": 1, "direction": hunt.get("direction"), "target": hunt.get("target"), "type": hunt.get("type")}
+    result["reaction"] = {"move": 2, "direction": reaction.get("direction"), "target": reaction.get("target"), "type": reaction.get("type")}
+    result["real_move"] = {"move": 3, "direction": real.get("direction"), "target": real.get("target"), "type": real.get("type")}
+    result["reasoning"] = reasoning
+    
+    # Order type
+    if direction == "BUY":
+        result["order_type"] = "LIMIT (llegamos a ellos)"
+        result["action"] = f"BUY LIMIT {entry_price:.5f}"
+    else:
+        result["order_type"] = "LIMIT (ellos vienen a nosotros)"
+        result["action"] = f"SELL LIMIT {entry_price:.5f}"
+    
+    # Verdict
+    if rr >= 2 and sl_pips <= 10:
+        result["verdict"] = f"✅ SNIPER LISTO — {direction} LIMIT {entry_price:.5f} | SL {sl_price:.5f} ({sl_pips:.0f}p) | TP {tp_price:.5f} ({tp_pips:.0f}p) | RR 1:{rr} | {reasoning}"
+        result["confidence"] = "HIGH" if rr >= 3 else "MEDIUM"
+    elif rr >= 1:
+        result["verdict"] = f"⚠️ SNIPER — {direction} LIMIT {entry_price:.5f} | RR 1:{rr} | {reasoning}"
+        result["confidence"] = "LOW"
+    else:
+        result["verdict"] = "⏸️ SNIPER — RR muy bajo, esperar mejor setup"
+        result["action"] = "WAIT"
+    
+    return result
+
+T("anticipation_sniper", lambda args: anticipation_sniper(
+    _mt5_direct, args.get("symbol","EURUSD")),
+  "🎬 ESTRATEGIA DEL VIDEO: Market Brain predice hunt→reaction→real. Ponemos LIMIT donde termina el hunt. Entramos ANTES que todos. Ellos compran caro, nosotros compramos barato.",
+  {"symbol":{"type":"string","default":"EURUSD"}})
+
 _mt5_direct = None
 
 # Load persistent state on import
