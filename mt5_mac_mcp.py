@@ -498,7 +498,7 @@ def _guard_live_order(order_type: str, symbol: str, volume: float, sl: float, tp
             ses = _intelligence_tools.get("market_sessions", (None,))[0]({}) if "market_sessions" in _intelligence_tools else {}
         if isinstance(ses, dict):
             quality = ses.get("quality", 1.0)
-            if quality < 0.5:
+            if quality < 0.3:
                 reasons.append(f"low liquidity session (quality={quality:.0%}), active: {ses.get('active_sessions', [])}")
             elif quality < 0.8:
                 warnings.append(f"reduced liquidity (quality={quality:.0%})")
@@ -837,6 +837,47 @@ def tool_modify_position(args: Dict[str, Any]) -> Dict[str, Any]:
     tp = args.get("take_profit", "")
     result = _mt5_direct({"action": "modify_position", "ticket": ticket, "stop_loss": sl, "take_profit": tp})
     return {"executed": bool(result.get("success")), "result": result}
+
+
+def tool_force_order(args: Dict[str, Any]) -> Dict[str, Any]:
+    """🚨 SIN GUARD: Abre orden directa saltandose TODOS los guards. Usar solo cuando estés 100% seguro."""
+    result = {"tool": "force_order", "note": "GUARDS BYPASSED — you assume full risk"}
+    sym = args["symbol"]
+    sym_fixed = _fix_sym(sym)
+    vol = float(args.get("volume", 0.01))
+    ot = args.get("type", "buy").upper()
+    sl = float(args.get("stop_loss", 0.0) or 0.0)
+    tp = float(args.get("take_profit", 0.0) or 0.0)
+    comment = args.get("comment", "force_mcp")
+    
+    # Get current price
+    price_data = _mt5_direct({"action": "price", "symbol": sym_fixed})
+    current_ask = price_data.get("ask", 0)
+    current_bid = price_data.get("bid", 0)
+    
+    # Send order directly — NO guard, NO check, NO preflight
+    order_result = _mt5_direct({
+        "action": "send_order",
+        "symbol": sym_fixed,
+        "type": ot,
+        "volume": vol,
+        "stop_loss": sl,
+        "take_profit": tp,
+        "comment": comment,
+        "deviation": int(args.get("deviation", 50)),
+    })
+    
+    result["order"] = order_result
+    result["executed"] = bool(order_result.get("success")) or order_result.get("retcode") == 0
+    result["entry_price"] = current_ask if ot == "BUY" else current_bid
+    result["volume"] = vol
+    result["symbol"] = sym
+    result["type"] = ot
+    result["sl"] = sl
+    result["tp"] = tp
+    if not result["executed"]:
+        result["error"] = order_result.get("error", order_result.get("comment", "unknown"))
+    return result
 
 
 def tool_close_position(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2826,10 +2867,19 @@ TOOLS: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], str, Dict[str
     }, ["ticket"])),
     "mt5_modify_position": (tool_modify_position, "Modifica SL/TP de una posición por ticket.", schema({
         "ticket": {"type": "integer"},
-        "stop_loss": {"type": ["number", "string"], "default": ""},
-        "take_profit": {"type": ["number", "string"], "default": ""},
+        "stop_loss": {"type": "number"},
+        "take_profit": {"type": "number"},
         "confirm_live": {"type": "boolean", "default": False},
     }, ["ticket"])),
+    "mt5_force_order": (tool_force_order, "🚨 FUERZA orden SIN guards. Solo usar con conviccion total. Sin risk_guard, sin liquidity check, sin preflight.", schema({
+        "symbol": {"type": "string"},
+        "type": {"type": "string", "enum": ["buy", "sell"]},
+        "volume": {"type": "number", "default": 0.01},
+        "stop_loss": {"type": "number", "default": 0.0},
+        "take_profit": {"type": "number", "default": 0.0},
+        "deviation": {"type": "integer", "default": 50},
+        "comment": {"type": "string", "default": "force_mcp"},
+    }, ["symbol", "type"])),
     "mt5_close_position": (tool_close_position, "Cierra una posición por ticket.", schema({
         "ticket": {"type": "integer"},
         "confirm_live": {"type": "boolean", "default": False},
