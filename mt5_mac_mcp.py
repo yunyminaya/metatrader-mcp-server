@@ -2258,48 +2258,67 @@ def _backtest_quick(candles, strategy="ma_cross"):
         "net_pnl": round(balance - 100, 2),
     }
 
+BG_STATE_FILE = DATA_DIR / "bg_state.json"
+
+def _read_bg_state():
+    """Read state from the persistent bg daemon."""
+    if not BG_STATE_FILE.exists():
+        return {"status": "daemon_not_running", "note": "Run: python3 mt5_bg_daemon.py &"}
+    try:
+        return json.loads(BG_STATE_FILE.read_text())
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 def tool_bg_status(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Get the latest pre-computed market data. Everything is ready instantly."""
-    global _BG_STATE
-    st = _BG_STATE
+    """Get pre-computed market data from the persistent bg daemon. Instant response."""
+    st = _read_bg_state()
+    if st.get("status") not in ("running",):
+        return st
     
-    # Pick best tradeable pair right now
-    best = None
+    symbols = {}
+    top = None
     for sym, d in st.get("symbols", {}).items():
-        if isinstance(d, dict) and d.get("tradeable") and d.get("backtest", {}).get("signal") == "GOOD":
-            if not best or d.get("backtest", {}).get("win_rate", 0) > best.get("backtest", {}).get("win_rate", 0):
-                best = {"symbol": sym, "data": d}
+        if isinstance(d, dict):
+            sd = {k: d.get(k) for k in ("bid","ask","spread","trend","rsi","rsi_signal",
+                "momentum","volatility","bt_signal","bt_win_rate","atr_pips","sl_pips","tp_pips",
+                "tradeable","scenarios","resist","support") if k in d}
+            symbols[sym] = sd
+            if sd.get("tradeable") and sd.get("bt_signal") == "GOOD":
+                if not top or (sd.get("bt_win_rate", 0) or 0) > (top.get("bt_win_rate", 0) or 0):
+                    top = {"symbol": sym, **sd}
     
     return {
-        "status": st["status"],
-        "last_update": st["last_update"],
-        "market_context": st.get("market_context", {}),
-        "top_opportunity": best,
-        "symbols": {
-            sym: {k: v for k, v in d.items() if k in ("bid","ask","spread","momentum_pct","volatility_pct","rsi_h1","trend","tradeable","backtest")}
-            for sym, d in st.get("symbols", {}).items() if isinstance(d, dict)
-        },
-        "errors": st.get("errors", [])[-3:] if st.get("errors") else [],
+        "status": st.get("status"),
+        "last_update": st.get("timestamp"),
+        "session": st.get("session"), "session_quality": st.get("session_quality"),
+        "market_volatility": st.get("market_volatility"),
+        "best_pairs": st.get("best_pairs", []),
+        "top_opportunity": top,
+        "symbols": symbols,
     }
 
 def tool_bg_start(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Start the background precompute engine. Prepares everything before you trade."""
-    global _BG_THREAD
-    import threading
-    
-    if _BG_THREAD and _BG_THREAD.is_alive():
-        return {"status": "already_running"}
-    
-    _BG_THREAD = threading.Thread(target=_bg_loop, daemon=True)
-    _BG_THREAD.start()
-    return {"status": "started", "symbols": _BG_SYMBOLS, "cycle_seconds": 7}
+    """Start the persistent bg daemon. Runs independently 24/7."""
+    import subprocess
+    script = Path(__file__).with_name("mt5_bg_daemon.py")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=Path(__file__).parent,
+        )
+        return {"status": "started", "pid": proc.pid, "log": "bg_daemon.log"}
+    except Exception as e:
+        return {"error": str(e)}
 
 def tool_bg_stop(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Stop the background engine."""
-    global _BG_THREAD, _BG_STATE
-    _BG_THREAD = None
-    _BG_STATE["status"] = "stopped"
-    return {"status": "stopped"}
+    """Stop the bg daemon."""
+    import subprocess
+    try:
+        subprocess.run(["pkill", "-f", "mt5_bg_daemon.py"], timeout=5)
+        return {"status": "stopped"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def schema(props: Dict[str, Any], required: Optional[List[str]] = None) -> Dict[str, Any]:
