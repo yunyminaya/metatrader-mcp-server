@@ -630,6 +630,15 @@ def handle(cmd):
     if action == "modify_position": return modify_position(cmd)
     if action == "close_position": return close_position(cmd)
     if action == "close_all": return close_all(cmd)
+    if action == "batch":
+        commands = cmd.get("commands", [])
+        results = []
+        for subcmd in commands:
+            try:
+                results.append(handle(subcmd))
+            except Exception as e:
+                results.append({"error": str(e), "cmd": subcmd})
+        return {"results": results, "count": len(results)}
     return {"error": f"unknown action: {action}"}
 
 
