@@ -3112,6 +3112,126 @@ T("rocket_mode", lambda args: rocket_mode(
   "🚀 MODO 100x: escanea todos los pares, encuentra la mecha encendida, calcula la escalera de compounding completa. Una llamada = el plan para 100x tu balance HOY.",
   {"bankroll":{"type":"number"},"target_multiple":{"type":"integer","default":100}})
 
+# ── Quick Double: Duplica el Balance Rápido ──────────────────────────────
+def quick_double(client, bankroll=None):
+    """🎯 Estrategia para duplicar el balance HOY: squeeze breakout + compounding escalera."""
+    result = {"timestamp": datetime.now(timezone.utc).isoformat()}
+    try:
+        acct = _account(client).get("account", {})
+        balance = bankroll or acct.get("balance", acct.get("equity", 41))
+    except:
+        balance = bankroll or 41
+    balance = max(balance, 1)
+    result["balance"] = round(balance, 2)
+    result["target"] = round(balance * 2, 2)
+    result["need_pips_double"] = round(balance / 0.10, 0)  # $0.10/pip with 0.01 lot
+    result["need_pips_005"] = round(balance / 0.50, 0)      # $0.50/pip with 0.05 lot
+    
+    # Current squeeze state from EURUSD
+    sym = "EURUSD"
+    price = _price(client, sym)
+    pip = 0.0001
+    bid = price.get("bid", 0)
+    ask = price.get("ask", 0)
+    spread = price.get("spread", 0)
+    result["current_price"] = {"bid": bid, "ask": ask, "spread": spread}
+    
+    # Get BB levels from volatility
+    m5 = _candles(client, sym, "M5", 30).get("candles", [])
+    m15 = _candles(client, sym, "M15", 30).get("candles", [])
+    
+    bb = {"m5": {}, "m15": {}, "h1": {}}
+    if m5 and len(m5) > 5:
+        c5 = [x["close"] for x in m5]
+        mean5 = sum(c5) / len(c5)
+        std5 = (sum((x - mean5)**2 for x in c5) / len(c5))**0.5
+        bb["m5"] = {"upper": mean5 + 2*std5, "lower": mean5 - 2*std5, "mid": mean5, "width": round(std5*4/mean5*100, 2)}
+    if m15 and len(m15) > 5:
+        c15 = [x["close"] for x in m15]
+        mean15 = sum(c15) / len(c15)
+        std15 = (sum((x - mean15)**2 for x in c15) / len(c15))**0.5
+        bb["m15"] = {"upper": mean15 + 2*std15, "lower": mean15 - 2*std15, "mid": mean15, "width": round(std15*4/mean15*100, 2)}
+    result["bollinger"] = bb
+    
+    # Breakout levels
+    m5_upper = bb["m5"].get("upper", 0)
+    m5_lower = bb["m5"].get("lower", 0)
+    m15_upper = bb["m15"].get("upper", 0)
+    m15_lower = bb["m15"].get("lower", 0)
+    
+    # The plan
+    result["breakout_plan"] = {
+        "range": f"{m5_lower:.5f} - {m5_upper:.5f}",
+        "range_pips": round((m5_upper - m5_lower) / pip, 1) if m5_upper and m5_lower else 0,
+        "buy_breakout": {
+            "trigger": f"Price > {m5_upper:.5f}",
+            "entry": m5_upper,
+            "sl": m5_lower,
+            "tp_targets": [
+                {"name": "target_1", "price": m15_upper, "pips": round((m15_upper - m5_upper) / pip, 1)} if m15_upper else None,
+            ],
+            "rr_ratio": round((m15_upper - m5_upper) / (m5_upper - m5_lower), 1) if m15_upper and m5_upper and m5_lower else 0,
+        },
+        "sell_breakout": {
+            "trigger": f"Price < {m5_lower:.5f}",
+            "entry": m5_lower,
+            "sl": m5_upper,
+            "tp_targets": [
+                {"name": "target_1", "price": m15_lower, "pips": round((m5_lower - m15_lower) / pip, 1)} if m15_lower else None,
+            ],
+            "rr_ratio": round((m5_upper - m5_lower) / (m5_lower - m15_lower), 1) if m15_lower and m5_upper and m5_lower else 0,
+        },
+    }
+    
+    # Compounding ladder to double
+    ladder = []
+    cb = balance
+    target = balance * 2
+    step = 0
+    while cb < target and step < 10:
+        step += 1
+        max_lot_margin = round(cb / 25.5, 2)  # $25.5 margin per 0.01 lot observed
+        lot = max(0.01, min(max_lot_margin, round(cb * 0.003, 2)))  # conservative 0.3% scaling
+        pips_needed = round((target - cb) / (lot * 10), 0) if lot > 0 else 999
+        pips_per_trade = min(50, pips_needed)  # cap at 50 pips per trade
+        gain = lot * pips_per_trade * 10
+        new_balance = min(cb + gain, target)
+        ladder.append({
+            "step": step, "lot": lot, "balance_before": round(cb, 2),
+            "pips_target": pips_per_trade, "gain": round(gain, 2),
+            "balance_after": round(new_balance, 2),
+        })
+        cb = new_balance
+        if step >= 5:
+            break  # don't over-plan
+    result["compounding_ladder"] = ladder
+    
+    # Best strategy recommendation
+    m5_w = bb["m5"].get("width", 100)
+    if m5_w < 3:
+        result["strategy"] = "SQUEEZE BREAKOUT"
+        result["action"] = "STANDBY — esperar breakout"
+        result["timer"] = "M5 squeeze width {:.1f}% — estallido inminente (tipicamente <15min)".format(m5_w)
+        if m5_upper and m5_lower:
+            result["entry_plan"] = f"Colocar BUY STOP a {m5_upper:.5f} + 1pip + SELL STOP a {m5_lower:.5f} - 1pip"
+    else:
+        result["strategy"] = "TREND FOLLOW"
+        result["action"] = "SCOUT"
+    
+    # Margin check
+    result["margin_info"] = {
+        "max_lot_balance": round(balance / 25.5, 2),  # based on observed $25.5/0.01 lot
+        "recommended_lot": 0.01,
+        "account_leverage": 200,
+    }
+    
+    return result
+
+T("quick_double", lambda args: quick_double(
+    _mt5_direct, args.get("bankroll")),
+  "🎯 ESTRATEGIA PARA DUPLICAR: squeeze breakout + compounding ladder. Te dice exactamente donde poner las ordenes para atrapar el breakout y duplicar.",
+  {"bankroll":{"type":"number"}})
+
 _mt5_direct = None
 
 # Load persistent state on import
