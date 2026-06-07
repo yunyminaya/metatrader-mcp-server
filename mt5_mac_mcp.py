@@ -1918,6 +1918,290 @@ def tool_scanner_signals(args: Dict[str, Any]) -> Dict[str, Any]:
     return _SCANNER_RESULTS if _SCANNER_RESULTS else {"status": "idle", "signals": []}
 
 
+# ── Background Precompute Engine ──
+
+_BG_THREAD = None
+_BG_STATE = {
+    "status": "idle",
+    "last_update": None,
+    "symbols": {},
+    "backtests": {},
+    "market_context": {},
+    "errors": [],
+}
+
+_BG_SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD", "NZDUSD", "USDCHF"]
+
+def _bg_loop():
+    """Background engine: precomputes everything continuously."""
+    global _BG_STATE, _BG_THREAD
+    import threading
+    
+    while True:
+        if not _BG_THREAD or not threading.current_thread().is_alive():
+            return
+        
+        try:
+            now = datetime.now(timezone.utc)
+            updates = {}
+            bt_cache = {}
+            context = {}
+            
+            for sym in _BG_SYMBOLS:
+                try:
+                    s = _fix_sym(sym)
+                    
+                    # 1. Price + spread
+                    price = _mt5_direct({"action": "price", "symbol": s})
+                    updates[sym] = {
+                        "bid": price.get("bid", 0),
+                        "ask": price.get("ask", 0),
+                        "spread": price.get("spread", 99),
+                        "tradeable": price.get("spread", 99) < 80 and price.get("bid", 0) > 0,
+                    }
+                    
+                    # 2. Candles (M5 + H1) for analysis
+                    m5_raw = _mt5_direct({"action": "candles", "symbol": s, "timeframe": "M5", "count": 50})
+                    h1_raw = _mt5_direct({"action": "candles", "symbol": s, "timeframe": "H1", "count": 200})
+                    m5 = m5_raw.get("candles", m5_raw.get("data", []))
+                    h1 = h1_raw.get("candles", h1_raw.get("data", []))
+                    
+                    # 3. Quick momentum (last 3 M5 candles)
+                    if len(m5) >= 4:
+                        recent = m5[-4:]
+                        mom = (recent[-1]["close"] - recent[-4]["close"]) / recent[-4]["close"] * 100
+                        updates[sym]["momentum_pct"] = round(mom, 3)
+                        updates[sym]["volatility_pct"] = round(
+                            sum(c["high"] - c["low"] for c in recent) / sum(c["close"] for c in recent) * 100 * 4, 3
+                        )
+                    else:
+                        updates[sym]["momentum_pct"] = 0
+                        updates[sym]["volatility_pct"] = 0
+                    
+                    # 4. Quick RSI (H1, last 14)
+                    if len(h1) >= 15:
+                        closes = [c["close"] for c in h1[-15:]]
+                        gains = losses = 0
+                        for i in range(1, len(closes)):
+                            diff = closes[i] - closes[i-1]
+                            gains += max(diff, 0)
+                            losses += max(-diff, 0)
+                        rsi = 50
+                        if losses > 0:
+                            rs = gains / losses
+                            rsi = 100 - 100 / (1 + rs)
+                        updates[sym]["rsi_h1"] = round(rsi, 1)
+                    else:
+                        updates[sym]["rsi_h1"] = 50
+                    
+                    # 5. Quick EMA trend (H1)
+                    if len(h1) >= 20:
+                        closes = [c["close"] for c in h1]
+                        fast = sum(closes[-5:]) / 5
+                        slow = sum(closes[-20:]) / 20
+                        updates[sym]["trend"] = "up" if fast > slow else "down"
+                        updates[sym]["ema_fast"] = round(fast, 5)
+                        updates[sym]["ema_slow"] = round(slow, 5)
+                    else:
+                        updates[sym]["trend"] = "unknown"
+                    
+                    # 6. Backtest for current trend direction
+                    if updates[sym].get("tradeable") and len(h1) >= 200:
+                        direction = updates[sym].get("trend", "unknown")
+                        strategy = "ma_cross" if direction != "unknown" else "rsi_mean_reversion"
+                        bt = _backtest_quick(h1, strategy)
+                        bt_cache[sym] = bt
+                        if bt:
+                            updates[sym]["backtest"] = {
+                                "win_rate": bt.get("win_rate_pct", 0),
+                                "profit_factor": bt.get("profit_factor", 0),
+                                "sharpe": bt.get("sharpe", 0),
+                                "strategy": strategy,
+                                "signal": "GOOD" if bt.get("win_rate_pct", 0) > 55 and bt.get("profit_factor", 0) != "inf" and float(bt.get("profit_factor", 0) or 0) > 1.2 else "NEUTRAL" if bt.get("win_rate_pct", 0) > 40 else "SKIP",
+                            }
+                    
+                except Exception as e:
+                    updates[sym] = {"error": str(e)}
+            
+            # 7. Market context (trading session, volatility regime)
+            try:
+                hour = now.hour
+                if 8 <= hour < 17:
+                    session = "London"
+                    quality = "high"
+                elif 13 <= hour < 22:
+                    session = "NY"
+                    quality = "high" if 13 <= hour < 17 else "medium"
+                elif 0 <= hour < 9:
+                    session = "Asia/Pacific"
+                    quality = "low"
+                else:
+                    session = "off_hours"
+                    quality = "very_low"
+                context["session"] = session
+                context["session_quality"] = quality
+                context["hour_utc"] = hour
+                
+                # Overall market volatility from EURUSD
+                if "EURUSD" in updates:
+                    v = updates["EURUSD"].get("volatility_pct", 0)
+                    if v < 0.05:
+                        context["volatility_regime"] = "quiet"
+                    elif v < 0.15:
+                        context["volatility_regime"] = "normal"
+                    else:
+                        context["volatility_regime"] = "volatile"
+                
+                # Best pairs right now
+                ranked = sorted(
+                    [(sym, d) for sym, d in updates.items() if isinstance(d, dict) and d.get("tradeable")],
+                    key=lambda x: x[1].get("backtest", {}).get("win_rate", 0) if x[1].get("backtest") else 0,
+                    reverse=True,
+                )
+                context["best_pairs"] = [
+                    {"symbol": sym, "trend": d.get("trend", "?"), 
+                     "win_rate": d.get("backtest", {}).get("win_rate", 0) if d.get("backtest") else 0,
+                     "spread": d.get("spread", 99)}
+                    for sym, d in ranked[:3] if d.get("tradeable")
+                ]
+            except Exception as e:
+                context["error"] = str(e)
+            
+            _BG_STATE = {
+                "status": "running",
+                "last_update": now.isoformat(),
+                "symbols": updates,
+                "backtests": bt_cache,
+                "market_context": context,
+                "errors": [],
+            }
+            
+        except Exception as e:
+            _BG_STATE["errors"].append(str(e))
+            if len(_BG_STATE["errors"]) > 10:
+                _BG_STATE["errors"] = _BG_STATE["errors"][-10:]
+        
+        # Sleep 45 seconds between full cycles
+        for _ in range(45):
+            if not _BG_THREAD or not threading.current_thread().is_alive():
+                return
+            time.sleep(1)
+
+def _backtest_quick(candles, strategy="ma_cross"):
+    """Ultra-fast backtest using already-fetched candles."""
+    if len(candles) < 30:
+        return None
+    closes = [c["close"] for c in candles]
+    
+    def ema(data, period):
+        if len(data) < period:
+            return [None] * len(data)
+        result = []
+        mult = 2 / (period + 1)
+        ema_val = sum(data[:period]) / period
+        for i in range(len(data)):
+            if i < period - 1:
+                result.append(None)
+            elif i == period - 1:
+                result.append(ema_val)
+            else:
+                ema_val = (data[i] - ema_val) * mult + ema_val
+                result.append(ema_val)
+        return result
+    
+    fast_ema = ema(closes, 5)
+    slow_ema = ema(closes, 20)
+    
+    trades = []
+    balance = 100.0
+    in_position = None
+    
+    for i in range(20, len(closes) - 1):
+        if fast_ema[i] is None or slow_ema[i] is None:
+            continue
+        
+        if strategy == "ma_cross":
+            if in_position is None:
+                if fast_ema[i-1] <= slow_ema[i-1] and fast_ema[i] > slow_ema[i]:
+                    in_position = {"type": "BUY", "entry": closes[i], "idx": i}
+                elif fast_ema[i-1] >= slow_ema[i-1] and fast_ema[i] < slow_ema[i]:
+                    in_position = {"type": "SELL", "entry": closes[i], "idx": i}
+            
+            if in_position:
+                pnl_pct = 0
+                if in_position["type"] == "BUY":
+                    # Exit on opposite signal or after 10 candles
+                    if i - in_position["idx"] >= 10 or (i > in_position["idx"] and fast_ema[i-1] >= slow_ema[i-1] and fast_ema[i] < slow_ema[i]):
+                        pnl_pct = (closes[i] - in_position["entry"]) / in_position["entry"]
+                else:
+                    if i - in_position["idx"] >= 10 or (i > in_position["idx"] and fast_ema[i-1] <= slow_ema[i-1] and fast_ema[i] > slow_ema[i]):
+                        pnl_pct = (in_position["entry"] - closes[i]) / in_position["entry"]
+                
+                if pnl_pct != 0:
+                    pnl = balance * pnl_pct * 10
+                    balance += pnl
+                    trades.append(pnl)
+                    in_position = None
+    
+    if len(trades) < 3:
+        return None
+    
+    wins = sum(1 for t in trades if t > 0)
+    losses = sum(1 for t in trades if t <= 0)
+    total_won = sum(t for t in trades if t > 0)
+    total_lost = abs(sum(t for t in trades if t <= 0))
+    
+    return {
+        "total_trades": len(trades),
+        "win_rate_pct": round(wins / len(trades) * 100, 1),
+        "profit_factor": round(total_won / total_lost, 2) if total_lost > 0 else "inf",
+        "net_pnl": round(balance - 100, 2),
+    }
+
+def tool_bg_status(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Get the latest pre-computed market data. Everything is ready instantly."""
+    global _BG_STATE
+    st = _BG_STATE
+    
+    # Pick best tradeable pair right now
+    best = None
+    for sym, d in st.get("symbols", {}).items():
+        if isinstance(d, dict) and d.get("tradeable") and d.get("backtest", {}).get("signal") == "GOOD":
+            if not best or d.get("backtest", {}).get("win_rate", 0) > best.get("backtest", {}).get("win_rate", 0):
+                best = {"symbol": sym, "data": d}
+    
+    return {
+        "status": st["status"],
+        "last_update": st["last_update"],
+        "market_context": st.get("market_context", {}),
+        "top_opportunity": best,
+        "symbols": {
+            sym: {k: v for k, v in d.items() if k in ("bid","ask","spread","momentum_pct","volatility_pct","rsi_h1","trend","tradeable","backtest")}
+            for sym, d in st.get("symbols", {}).items() if isinstance(d, dict)
+        },
+        "errors": st.get("errors", [])[-3:] if st.get("errors") else [],
+    }
+
+def tool_bg_start(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Start the background precompute engine. Prepares everything before you trade."""
+    global _BG_THREAD
+    import threading
+    
+    if _BG_THREAD and _BG_THREAD.is_alive():
+        return {"status": "already_running"}
+    
+    _BG_THREAD = threading.Thread(target=_bg_loop, daemon=True)
+    _BG_THREAD.start()
+    return {"status": "started", "symbols": _BG_SYMBOLS, "cycle_seconds": 45}
+
+def tool_bg_stop(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Stop the background engine."""
+    global _BG_THREAD, _BG_STATE
+    _BG_THREAD = None
+    _BG_STATE["status"] = "stopped"
+    return {"status": "stopped"}
+
+
 def schema(props: Dict[str, Any], required: Optional[List[str]] = None) -> Dict[str, Any]:
     return {"type": "object", "properties": props, "required": required or []}
 
@@ -2209,6 +2493,9 @@ TOOLS: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], str, Dict[str
     })),
     "mt5_scanner_stop": (tool_scanner_stop, "Stop the real-time background scanner.", schema({})),
     "mt5_scanner_signals": (tool_scanner_signals, "Get latest scanner signals and status.", schema({})),
+    "mt5_bg_start": (tool_bg_start, "START background precompute engine. Prepares everything in advance 24/7.", schema({})),
+    "mt5_bg_stop": (tool_bg_stop, "STOP background precompute engine.", schema({})),
+    "mt5_bg_status": (tool_bg_status, "Get pre-computed market data. ALL analysis ready instantly — no waiting.", schema({})),
 }
 
 # Merge intelligence tools
