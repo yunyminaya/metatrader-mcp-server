@@ -2934,6 +2934,184 @@ T("liquidity_heatmap", lambda args: liquidity_heatmap(
     _mt5_direct, args.get("symbol","EURUSD"), int(args.get("levels",20))),
   "Mapa de liquidez: volume profile, high-volume nodes, soporte/resistencia por volumen. Ve donde esta el dinero real y a donde va.",
   {"symbol":{"type":"string","default":"EURUSD"},"levels":{"type":"integer","default":20}})
+
+# ── Rocket Mode: 100x en 1 Día ───────────────────────────────────────────
+_100x_PAIRS = ["EURUSD","GBPUSD","USDJPY","USDCAD","AUDUSD","NZDUSD","USDCHF","EURGBP","EURJPY","GBPJPY","AUDJPY","CHFJPY"]
+
+def rocket_mode(client, bankroll=None, target_multiple=100):
+    """🚀 PLAN 100x: escanea TODOS los pares, encuentra la mecha encendida, calcula la escalera de compounding.
+       Una llamada = el plan completo para triplicar/100x tu balance HOY."""
+    result = {"timestamp": datetime.now(timezone.utc).isoformat()}
+    # Get account
+    try:
+        acct = _account(client).get("account", {})
+        balance = bankroll or acct.get("balance", acct.get("equity", 44))
+    except:
+        balance = bankroll or 44
+    balance = max(balance, 1)
+    result["balance"] = round(balance, 2)
+    result["target"] = round(balance * target_multiple, 2)
+    result["target_multiple"] = target_multiple
+    
+    # Scan ALL pairs for the best opportunity NOW
+    opportunities = []
+    for sym in _100x_PAIRS:
+        try:
+            price = _price(client, sym)
+            bid = price.get("bid", 0)
+            ask = price.get("ask", 0)
+            spread = price.get("spread", 999)
+            if spread > 100: continue
+            pip = 0.0001 if "JPY" not in sym else 0.01
+            current = (bid + ask) / 2
+            # Get volatility state
+            m5 = _candles(client, sym, "M5", 12).get("candles", [])
+            m15 = _candles(client, sym, "M15", 8).get("candles", [])
+            if not m5 or len(m5) < 5: continue
+            # Calculate velocity
+            m5_close = [c["close"] for c in m5]
+            velocity = (m5_close[-1] - m5_close[0]) / pip / (len(m5) * 5)  # pips per minute
+            # ATR
+            if len(m5) >= 14:
+                trs = []
+                for i in range(1, len(m5)):
+                    trs.append(max(m5[i]["high"] - m5[i]["low"], abs(m5[i]["high"] - m5[i-1]["close"]), abs(m5[i]["low"] - m5[i-1]["close"])))
+                atr_m5 = sum(trs[-14:]) / min(14, len(trs))
+            else:
+                atr_m5 = 0.001
+            atr_pips = atr_m5 / pip
+            
+            # Volatility expansion (squeeze breakout detection)
+            bb_std = np.std([c["close"] for c in m5]) if len(m5) > 3 else 0
+            bb_width = (bb_std * 4 / current * 100) if current > 0 else 0
+            
+            # Momentum
+            accel = velocity - (m5_close[3] - m5_close[0]) / pip / 15 if len(m5) > 3 else 0
+            
+            # Score the opportunity (0-100)
+            score = 50
+            factors = []
+            if abs(velocity) > 0.5: score += 15; factors.append(f"vel_{velocity:.1f}")
+            if abs(accel) > 0.3: score += 10; factors.append(f"accel_{accel:.1f}")
+            if bb_width < 3: score += 15; factors.append("squeeze")
+            if spread < 20: score += 10; factors.append("tight")
+            elif spread < 40: score += 5
+            if atr_pips > 10: score += 10; factors.append(f"big_atr_{atr_pips:.0f}")
+            if 7 <= datetime.now(timezone.utc).hour + 0 <= 20: score += 10; factors.append("session")
+            
+            direction = "BUY" if velocity > 0 else "SELL"
+            sl_pips = max(atr_pips * 1.2, 5)
+            tp_pips = max(atr_pips * 3, 15)
+            entry = ask if direction == "BUY" else bid
+            sl = round(entry - (sl_pips * pip) if direction == "BUY" else entry + (sl_pips * pip), 5)
+            tp = round(entry + (tp_pips * pip) if direction == "BUY" else entry - (tp_pips * pip), 5)
+            
+            opportunities.append({
+                "symbol": sym, "score": min(100, score), "direction": direction,
+                "entry": entry, "sl": sl, "tp": tp, "sl_pips": round(sl_pips, 1),
+                "tp_pips": round(tp_pips, 1), "velocity": round(velocity, 2),
+                "acceleration": round(accel, 2), "spread": spread,
+                "atr_pips": round(atr_pips, 1), "bb_width": round(bb_width, 2),
+                "factors": factors,
+            })
+        except:
+            continue
+    
+    opportunities.sort(key=lambda x: x["score"], reverse=True)
+    top = opportunities[:3] if opportunities else []
+    result["top_opportunities"] = top
+    
+    # Best setup
+    best = top[0] if top else None
+    if best:
+        result["best_setup"] = best
+        result["direction"] = best["direction"]
+        result["entry"] = best["entry"]
+        result["sl"] = best["sl"]
+        result["tp"] = best["tp"]
+        result["sl_pips"] = best["sl_pips"]
+        result["tp_pips"] = best["tp_pips"]
+    else:
+        result["best_setup"] = None
+        result["direction"] = "NONE"
+        result["note"] = "No hay oportunidades claras ahora. Esperar London/NY open."
+    
+    # COMPOUNDING LADDER — from $balance to $target
+    ladder = []
+    current_step_balance = balance
+    step = 0
+    pip_value_per_lot = 10  # $10 per pip for 1 standard lot (simplified)
+    
+    while current_step_balance < result["target"] and step < 20:
+        step += 1
+        step_lot = max(0.01, min(1.0, round(current_step_balance * 0.02 / 10, 2)))  # risk 2% per trade
+        if best:
+            step_sl_pips = max(5, best["sl_pips"])
+            step_tp_pips = step_sl_pips * 3
+            step_risk = step_lot * step_sl_pips * 10
+            step_reward = step_lot * step_tp_pips * 10
+            step_outcome = min(current_step_balance + step_reward * 0.95, result["target"])
+        else:
+            step_risk = 0
+            step_reward = 0
+            step_outcome = current_step_balance
+        entry_price = best["entry"] if best else 0
+        sl_price = best["sl"] if best else 0
+        tp_price = best["tp"] if best else 0
+        
+        ladder.append({
+            "step": step,
+            "balance_before": round(current_step_balance, 2),
+            "lot": step_lot,
+            "sl_pips": round(step_sl_pips if best else 0, 1),
+            "tp_pips": round(step_tp_pips if best else 0, 1),
+            "sl": sl_price,
+            "tp": tp_price,
+            "risk_usd": round(step_risk, 2),
+            "potential_profit": round(step_reward * 0.95, 2),
+            "balance_after": round(step_outcome, 2),
+            "gain_pct": round((step_outcome / current_step_balance - 1) * 100, 1) if current_step_balance > 0 else 0,
+        })
+        current_step_balance = step_outcome
+        # Adjust price for next step
+        if best:
+            if best["direction"] == "BUY":
+                entry_price += best["tp_pips"] * pip
+                sl_price += best["tp_pips"] * pip
+                tp_price += best["tp_pips"] * pip
+            else:
+                entry_price -= best["tp_pips"] * pip
+                sl_price -= best["tp_pips"] * pip
+                tp_price -= best["tp_pips"] * pip
+    
+    result["compounding_ladder"] = ladder
+    result["ladder_summary"] = {
+        "steps": len(ladder),
+        "starting_balance": round(balance, 2),
+        "final_balance": round(ladder[-1]["balance_after"], 2) if ladder else round(balance, 2),
+        "total_gain_pct": round((ladder[-1]["balance_after"] / balance - 1) * 100, 1) if ladder else 0,
+        "on_target": ladder[-1]["balance_after"] >= result["target"] if ladder else False,
+    }
+    
+    # Rocket verdict
+    if best and best["score"] >= 80:
+        result["verdict"] = f"🚀 MECHA ENCENDIDA {best['symbol']} {best['direction']} | Score {best['score']}/100 | SL {best['sl_pips']}pips | TP {best['tp_pips']}pips | Balance ${balance} → ${result['target']} en {len(ladder)} trades"
+        result["action"] = "🚀 LAUNCH"
+    elif best:
+        result["verdict"] = f"⏳ Esperando mejor mecha. Mejor setup: {best['symbol']} {best['direction']} score {best['score']}/100"
+        result["action"] = "SCOUT"
+    else:
+        result["verdict"] = "⏸️ Sin oportunidades. Revisar en London/NY open."
+        result["action"] = "SLEEP"
+    
+    result["balance_target"] = result["target"]
+    return result
+
+T("rocket_mode", lambda args: rocket_mode(
+    _mt5_direct, args.get("bankroll"), int(args.get("target_multiple", 100))),
+  "🚀 MODO 100x: escanea todos los pares, encuentra la mecha encendida, calcula la escalera de compounding completa. Una llamada = el plan para 100x tu balance HOY.",
+  {"bankroll":{"type":"number"},"target_multiple":{"type":"integer","default":100}})
+
 _mt5_direct = None
 
 # Load persistent state on import

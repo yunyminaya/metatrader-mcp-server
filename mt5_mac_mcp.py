@@ -2581,7 +2581,25 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
                           f"⏸️ SKIP — sin senal clara"
         result["action"] = "SKIP"
         result["confidence"] = 0
-        result["confidence"] = 0
+    
+    # 17. ROCKET MODE (100x plan) — included in omnisight
+    try:
+        from mt5_mcp_intelligence import rocket_mode
+        rm = rocket_mode(_mt5_direct, bankroll=result.get("balance"), target_multiple=100)
+        result["rocket"] = {
+            "balance": rm.get("balance"),
+            "target": rm.get("target"),
+            "best_setup": rm.get("best_setup"),
+            "ladder_steps": len(rm.get("compounding_ladder", [])),
+            "final_balance": rm.get("ladder_summary", {}).get("final_balance"),
+            "verdict": rm.get("verdict"),
+            "action": rm.get("action"),
+        }
+        if rm.get("compounding_ladder"):
+            result["rocket"]["first_trade"] = rm["compounding_ladder"][0]
+            result["rocket"]["ladder"] = rm["compounding_ladder"][:5]  # first 5 steps
+    except Exception as e:
+        result["rocket"] = {"error": str(e)}
     
     return result
 
