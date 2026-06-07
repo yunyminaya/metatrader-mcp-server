@@ -1409,6 +1409,284 @@ def ml_predict(mt5_direct_fn, symbol="EURUSD", timeframe="H1"):
     }
 
 
+# ── Smart Money Map: broker + order flow + manipulation ──
+
+def smart_money_map(mt5_direct_fn, symbol="EURUSD"):
+    """Analiza 4 capas: broker manipulation, smart money accumulator, order flow, stops clustering."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    sym = _fix_sym_local(symbol)
+    
+    # Fetch data
+    try:
+        price_raw = mt5_direct_fn({"action": "price", "symbol": sym})
+        m1_raw = mt5_direct_fn({"action": "candles", "symbol": sym, "timeframe": "M1", "count": 300})
+        h1_raw = mt5_direct_fn({"action": "candles", "symbol": sym, "timeframe": "H1", "count": 100})
+    except Exception as e:
+        return {"error": str(e)}
+    
+    bid = price_raw.get("bid", 0)
+    ask = price_raw.get("ask", 0)
+    spread = price_raw.get("spread", 99)
+    m1 = m1_raw.get("candles", m1_raw.get("data", []))
+    h1 = h1_raw.get("candles", h1_raw.get("data", []))
+    
+    if not m1 or not h1:
+        return {"error": "insufficient data"}
+    
+    # ── Layer 1: Broker Manipulation Detection ──
+    spreads = [c.get("spread", spread) for c in m1[-100:]]
+    avg_spread = sum(spreads) / len(spreads)
+    max_spread = max(spreads)
+    recent_spreads = spreads[-20:]
+    spread_volatility = (max(spreads) - min(spreads)) / (avg_spread or 1)
+    
+    # Spread widening events
+    widenings = sum(1 for i in range(1, len(recent_spreads)) if recent_spreads[i] > recent_spreads[i-1] * 1.5)
+    
+    broker_flags = []
+    if max_spread > avg_spread * 2:
+        broker_flags.append("spread_spikes_detected")
+    if widenings >= 3:
+        broker_flags.append("frequent_widening")
+    if spread > avg_spread * 1.3:
+        broker_flags.append("currently_wide")
+    
+    # Stop-hunt detection: price spikes to obvious levels then reverses
+    hunt_score = 0
+    recent_highs = [c["high"] for c in m1[-30:]]
+    recent_lows = [c["low"] for c in m1[-30:]]
+    max_h = max(recent_highs)
+    min_l = min(recent_lows)
+    round_up = round(bid + 0.001, 3) if "JPY" not in symbol else round(bid + 0.1, 1)
+    round_down = round(bid - 0.001, 3) if "JPY" not in symbol else round(bid - 0.1, 1)
+    
+    # Check if price hit a round number and reversed
+    for c in m1[-20:]:
+        if abs(c["high"] - round_up) / (round_up or 1) < 0.0003:
+            hunt_score += 1
+        if abs(c["low"] - round_down) / (round_down or 1) < 0.0003:
+            hunt_score += 1
+        # Wick detection: long wick into obvious level
+        body = abs(c["close"] - c["open"])
+        upper_wick = c["high"] - max(c["open"], c["close"])
+        lower_wick = min(c["open"], c["close"]) - c["low"]
+        if upper_wick > body * 2 and upper_wick > (c["high"] - c["low"]) * 0.6:
+            hunt_score += 1
+        if lower_wick > body * 2 and lower_wick > (c["high"] - c["low"]) * 0.6:
+            hunt_score += 1
+    
+    broker_trust = max(0, min(100, 100 - spread_volatility * 20 - widenings * 5 - hunt_score * 2))
+    broker_assessment = "reliable" if broker_trust > 70 else "suspicious" if broker_trust > 40 else "unreliable"
+    result["broker"] = {
+        "trust_score": round(broker_trust),
+        "assessment": broker_assessment,
+        "avg_spread": round(avg_spread, 1),
+        "max_spread": max_spread,
+        "spread_volatility": round(spread_volatility, 2),
+        "widenings_20": widenings,
+        "hunt_score": hunt_score,
+        "flags": broker_flags,
+        "original_spread": spread,
+    }
+    
+    # ── Layer 2: Smart Money Accumulation/Distribution ──
+    closes = [c["close"] for c in m1]
+    volumes = [c.get("tick_volume", c.get("volume", 0)) for c in m1]
+    
+    # Volume profile of last 100 candles
+    last_100 = m1[-100:] if len(m1) >= 100 else m1
+    price_bins = {}
+    for c in last_100:
+        price_key = round(c["close"], 4) if "JPY" not in symbol else round(c["close"], 2)
+        vol = c.get("tick_volume", c.get("volume", 0))
+        price_bins[price_key] = price_bins.get(price_key, 0) + vol
+    
+    # POC (Point of Control)
+    poc_price = max(price_bins, key=price_bins.get) if price_bins else bid
+    poc_vol = price_bins.get(poc_price, 0)
+    
+    # Accumulation: price moving sideways with increasing volume on dips
+    total_vol_50 = sum(volumes[-50:]) if len(volumes) >= 50 else sum(volumes)
+    total_vol_prev = sum(volumes[-100:-50]) if len(volumes) >= 100 else sum(volumes)
+    vol_trend = "increasing" if total_vol_50 > total_vol_prev * 1.1 else "decreasing" if total_vol_50 < total_vol_prev * 0.9 else "stable"
+    
+    # Price action characterization
+    range_100 = (max(c["high"] for c in last_100) - min(c["low"] for c in last_100)) / (bid or 1) * 100
+    last_10_closes = [c["close"] for c in m1[-10:]]
+    price_drift = (last_10_closes[-1] - last_10_closes[0]) / (last_10_closes[0] or 1) * 100
+    tight_range = range_100 < 0.3
+    
+    # Determine accumulation/distribution
+    sm_action = "neutral"
+    sm_confidence = 0
+    sm_zone = None
+    
+    if tight_range and vol_trend == "increasing" and abs(price_drift) < 0.1:
+        sm_action = "accumulating"
+        sm_confidence = 70
+        sm_zone = {"start": round(min(c["low"] for c in last_100), 5), "end": round(max(c["high"] for c in last_100), 5)}
+    elif tight_range and vol_trend == "decreasing" and abs(price_drift) < 0.05:
+        sm_action = "distributing"
+        sm_confidence = 60
+        sm_zone = {"start": round(min(c["low"] for c in last_100), 5), "end": round(max(c["high"] for c in last_100), 5)}
+    elif price_drift > 0.3 and vol_trend == "increasing":
+        sm_action = "institutional_buying"
+        sm_confidence = 65
+    elif price_drift < -0.3 and vol_trend == "increasing":
+        sm_action = "institutional_selling"
+        sm_confidence = 65
+    
+    # Absorption: price doesn't drop on selling volume (bullish)
+    sell_clusters = 0
+    buy_clusters = 0
+    for i in range(10, len(m1[-50:])):
+        c = m1[-50 + i]
+        prev = m1[-51 + i] if i > 0 else c
+        if c["close"] < c["open"] and c["close"] > prev["close"] and c.get("tick_volume", 0) > sum(v.get("tick_volume", 0) for v in m1[-55:-50]) / 5:
+            sell_clusters += 1  # sold off but held above prev close = absorption
+        if c["close"] > c["open"] and c["close"] < prev["close"] and c.get("tick_volume", 0) > sum(v.get("tick_volume", 0) for v in m1[-55:-50]) / 5:
+            buy_clusters += 1  # bought but couldn't break above = distribution
+    
+    absorption_ratio = sell_clusters / (buy_clusters + 1)
+    
+    result["smart_money"] = {
+        "action": sm_action,
+        "confidence": sm_confidence,
+        "accumulation_zone": sm_zone,
+        "poc_price": round(poc_price, 5),
+        "poc_volume": poc_vol,
+        "volume_trend": vol_trend,
+        "range_pct_100": round(range_100, 3),
+        "absorption_ratio": round(absorption_ratio, 2),
+        "vol_50": int(total_vol_50),
+        "vol_prev_50": int(total_vol_prev),
+    }
+    
+    # ── Layer 3: Order Flow Reconstruction ──
+    
+    # Tick velocity: acceleration/deceleration in price movement
+    if len(m1) >= 20:
+        recent_m = m1[-20:]
+        velocities = []
+        for i in range(1, len(recent_m)):
+            dt = recent_m[i]["time"] - recent_m[i-1]["time"]
+            dp = abs(recent_m[i]["close"] - recent_m[i-1]["close"])
+            velocities.append(dp / max(dt, 1))
+        
+        if velocities:
+            avg_v = sum(velocities) / len(velocities)
+            recent_v = velocities[-5:]
+            avg_recent = sum(recent_v) / len(recent_v)
+            acceleration = (avg_recent - avg_v) / (avg_v or 1) * 100
+        else:
+            acceleration = 0
+    else:
+        acceleration = 0
+    
+    # Directional pressure
+    up_volume = sum(c.get("tick_volume", 0) for c in m1[-10:] if c["close"] > c["open"])
+    dn_volume = sum(c.get("tick_volume", 0) for c in m1[-10:] if c["close"] <= c["open"])
+    total_v = up_volume + dn_volume
+    pressure_ratio = up_volume / (dn_volume or 1)
+    pressure = "bullish" if pressure_ratio > 1.3 else "bearish" if pressure_ratio < 0.7 else "balanced"
+    
+    # Momentum decay
+    body_sizes = [abs(c["close"] - c["open"]) for c in m1[-10:]]
+    body_trend = "increasing" if len(body_sizes) >= 3 and sum(body_sizes[-3:]) > sum(body_sizes[-6:-3]) else "decreasing" if len(body_sizes) >= 3 and sum(body_sizes[-3:]) < sum(body_sizes[-6:-3]) * 0.7 else "stable"
+    
+    result["order_flow"] = {
+        "acceleration_pct": round(acceleration, 1),
+        "directional_pressure": pressure,
+        "pressure_ratio": round(pressure_ratio, 2),
+        "up_volume_10": int(up_volume),
+        "down_volume_10": int(dn_volume),
+        "body_trend_10": body_trend,
+    }
+    
+    # ── Layer 4: Retail Stop Clusters ──
+    
+    stops = []
+    pip = 0.01 if "JPY" in symbol else 0.0001
+    
+    # Round numbers attract stops
+    for mult in range(-20, 21):
+        level = round(bid + mult * pip, 2 if "JPY" in symbol else 4)
+        if level <= 0:
+            continue
+        # Distance from current price
+        dist = abs(level - bid) / (pip or 1)
+        if dist > 50:
+            continue
+        # Popular stop levels: just above round numbers for shorts, below for longs
+        is_round = abs(level * 100 - round(level * 100)) < 0.01
+        if is_round:
+            stops.append({"price": round(level, 5), "type": "round_number", "distance_pips": round(dist, 1), "cluster_density": "high"})
+    
+    # Previous swing highs/lows attract stops
+    swing_highs = []
+    swing_lows = []
+    for i in range(2, len(m1) - 2):
+        if m1[i]["high"] > m1[i-1]["high"] > m1[i-2]["high"] and m1[i]["high"] > m1[i+1]["high"] > m1[i+2]["high"]:
+            swing_highs.append(m1[i]["high"])
+        if m1[i]["low"] < m1[i-1]["low"] < m1[i-2]["low"] and m1[i]["low"] < m1[i+1]["low"] < m1[i+2]["low"]:
+            swing_lows.append(m1[i]["low"])
+    
+    for sh in swing_highs[-5:]:
+        dist = abs(sh - bid) / (pip or 1)
+        if dist < 30:
+            stops.append({"price": round(sh, 5), "type": "swing_high", "distance_pips": round(dist, 1), "cluster_density": "medium"})
+    for sl in swing_lows[-5:]:
+        dist = abs(sl - bid) / (pip or 1)
+        if dist < 30:
+            stops.append({"price": round(sl, 5), "type": "swing_low", "distance_pips": round(dist, 1), "cluster_density": "medium"})
+    
+    # Stop-hunting recommendation: place SL BEYOND obvious zones
+    near_stops_above = [s for s in stops if s["price"] > bid and s["distance_pips"] < 15]
+    near_stops_below = [s for s in stops if s["price"] < bid and s["distance_pips"] < 15]
+    safest_sl_long = min([s["price"] for s in near_stops_below], default=bid - 3*pip) if near_stops_below else bid - 3*pip
+    safest_sl_short = max([s["price"] for s in near_stops_above], default=bid + 3*pip) if near_stops_above else bid + 3*pip
+    
+    result["retail_stops"] = {
+        "total_clusters": len(stops),
+        "stops_above_pips": len(near_stops_above),
+        "stops_below_pips": len(near_stops_below),
+        "safest_sl_long": round(safest_sl_long, 5),
+        "safest_sl_short": round(safest_sl_short, 5),
+        "clusters": sorted(stops, key=lambda x: x["distance_pips"])[:10],
+    }
+    
+    # ── VERDICT ──
+    verdict_parts = []
+    
+    if broker_trust < 50:
+        verdict_parts.append(f"BROKER: {broker_assessment.upper()} (trust={broker_trust})")
+    if sm_confidence > 50:
+        verdict_parts.append(f"SMART_MONEY: {sm_action.upper()} (conf={sm_confidence})")
+    if acceleration > 20:
+        verdict_parts.append(f"ACCELERATING {pressure.upper()}")
+    if near_stops_above and near_stops_below:
+        verdict_parts.append(f"STOPS: {len(near_stops_below)} below / {len(near_stops_above)} above")
+    
+    # Final recommendation
+    rec = None
+    if sm_action in ("accumulating", "institutional_buying") and broker_trust > 40 and pressure == "bullish":
+        rec = {"action": "BUY", "confidence": min(sm_confidence + 10, 90),
+               "sl": round(safest_sl_long - pip, 5), "reason": "smart_money_accumulating + bullish_pressure"}
+    elif sm_action in ("distributing", "institutional_selling") and broker_trust > 40 and pressure == "bearish":
+        rec = {"action": "SELL", "confidence": min(sm_confidence + 10, 90),
+               "sl": round(safest_sl_short + pip, 5), "reason": "smart_money_distributing + bearish_pressure"}
+    elif broker_trust < 40:
+        rec = {"action": "SKIP", "confidence": 30, "reason": f"broker_unreliable (trust={broker_trust})"}
+    elif near_stops_below and len(m1[-5:]) >= 3 and all(c["close"] < c["open"] for c in m1[-3:]):
+        rec = {"action": "BUY", "confidence": 55, "sl": round(safest_sl_long, 5),
+               "reason": "stops_below + retail_capitulation"}
+    
+    result["verdict"] = " | ".join(verdict_parts) if verdict_parts else "neutral_signals"
+    result["recommendation"] = rec
+    
+    return result
+
+
 # ── Helper ──
 _FX_PAIRS_SET = {"EURUSD","GBPUSD","USDJPY","USDCAD","USDCHF","AUDUSD","NZDUSD",
                  "EURGBP","EURJPY","EURCHF","AUDJPY","GBPJPY","CHFJPY","EURAUD",
@@ -1560,6 +1838,11 @@ T("journal_query", lambda args: journal_query(
     args.get("query","all"), int(args.get("limit",20))),
   "Query auto-journal: wins, losses, by symbol, by strategy.",
   {"query":{"type":"string","enum":["all","wins","losses"],"default":"all"},"limit":{"type":"integer","default":20}})
+
+T("smart_money_map", lambda args: smart_money_map(
+    _mt5_direct, args.get("symbol","EURUSD")),
+  "4-layer smart money analysis: broker manipulation, accumulation/distribution, order flow, stop clusters. Read the market's true intent.",
+  {"symbol":{"type":"string","default":"EURUSD"}})
 
 
 # Need _mt5_direct reference from the main server
