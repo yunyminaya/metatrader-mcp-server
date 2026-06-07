@@ -2236,12 +2236,307 @@ T("journal_auto_record", lambda args: journal_auto_record(
 
 T("journal_query", lambda args: journal_query(
     args.get("query","all"), int(args.get("limit",20))),
-  "Query auto-journal: wins, losses, by symbol, by strategy.",
+  "Auto-journal: wins, losses, by symbol, by strategy.",
   {"query":{"type":"string","enum":["all","wins","losses"],"default":"all"},"limit":{"type":"integer","default":20}})
 
 T("smart_money_map", lambda args: smart_money_map(
     _mt5_direct, args.get("symbol","EURUSD")),
   "4-layer smart money analysis: broker manipulation, accumulation/distribution, order flow, stop clusters. Read the market's true intent.",
+  {"symbol":{"type":"string","default":"EURUSD"}})
+
+# ── Broker Server Status ──────────────────────────────────────────────────
+def broker_server_status(client, symbol="EURUSD"):
+    """Broker server health: ping estimate, data freshness, connection quality, spread health."""
+    sym = _fix(symbol)
+    result = {"timestamp": datetime.now(timezone.utc).isoformat(), "symbol": sym}
+    # Account info for broker connection
+    account = _account(client)
+    if "error" not in account:
+        acct = account.get("account", account)
+        result["broker"] = acct.get("broker", "?")
+        result["server"] = acct.get("server", "?")
+        result["connection"] = acct.get("connection", "?")
+        result["trade_allowed"] = acct.get("trade_allowed", False)
+    # Price data freshness
+    t0 = time.monotonic()
+    price = _price(client, symbol)
+    latency = round((time.monotonic() - t0) * 1000, 1)
+    result["ping_ms"] = latency
+    result["data_freshness"] = "fast" if latency < 500 else "slow" if latency < 2000 else "stale"
+    # Spread-based health
+    spread = price.get("spread", 999)
+    if spread < 15:
+        sp_health = "excellent"
+    elif spread < 30:
+        sp_health = "good"
+    elif spread < 50:
+        sp_health = "normal"
+    elif spread < 80:
+        sp_health = "wide"
+    else:
+        sp_health = "unstable"
+    result["spread"] = spread
+    result["spread_health"] = sp_health
+    # Server quality score
+    score = 100
+    if latency > 1000: score -= 20
+    if latency > 3000: score -= 30
+    if spread > 50: score -= 15
+    if spread > 80: score -= 20
+    if not result.get("trade_allowed", True): score -= 40
+    result["server_quality"] = max(0, min(100, score))
+    result["advice"] = "TRADE" if score >= 70 else "CAUTION" if score >= 40 else "AVOID"
+    return result
+
+T("broker_server_status", lambda args: broker_server_status(
+    _mt5_direct, args.get("symbol","EURUSD")),
+  "Broker server health: ping, latency, data freshness, spread quality, connection status. Sabe si el broker esta listo o fallando.",
+  {"symbol":{"type":"string","default":"EURUSD"}})
+
+# ── Market Depth (DOM) ────────────────────────────────────────────────────
+def market_depth(client, symbol="EURUSD", levels=15):
+    """Full orderbook depth: stacked bids/asks with volume at each level."""
+    sym = _fix(symbol)
+    price = _price(client, symbol)
+    bid = price.get("bid", 0)
+    ask = price.get("ask", 0)
+    spread = price.get("spread", 0)
+    pip = 0.0001 if "JPY" not in symbol else 0.01
+    dom = {"symbol": symbol, "bid": bid, "ask": ask, "spread": spread}
+    # Build synthetic DOM from volume profile + book
+    try:
+        book = client({"action": "book", "symbol": sym})
+        if "error" not in book and book.get("book"):
+            dom["real_book"] = True
+            dom["bids"] = book.get("bids", [])[:levels]
+            dom["asks"] = book.get("asks", [])[:levels]
+        else:
+            dom["real_book"] = False
+    except:
+        dom["real_book"] = False
+    # Synthetic volume stacking from candles
+    try:
+        candles = _candles(client, symbol, "M5", 24).get("candles", [])
+        if candles:
+            vols = [c.get("tick_volume", c.get("volume", 0)) for c in candles]
+            avg_vol = sum(vols) / len(vols) if vols else 0
+            dom["avg_volume_5m"] = round(avg_vol, 1)
+            dom["volume_ratio"] = round(vols[-1] / avg_vol, 2) if avg_vol else 1.0 if vols else 1.0
+            # Estimate depth walls
+            dom["bid_wall_estimate"] = round(avg_vol * 3, 0)  # 3x avg = wall
+            dom["ask_wall_estimate"] = round(avg_vol * 3, 0)
+    except:
+        pass
+    # Synthetic level stacking
+    depth_bids = []
+    depth_asks = []
+    for i in range(1, levels + 1):
+        vol = max(1, int(round(dom.get("avg_volume_5m", 100) * (1 - i * 0.05))))
+        depth_bids.append({"price": round(bid - i * pip, 5), "volume": vol})
+        depth_asks.append({"price": round(ask + i * pip, 5), "volume": vol})
+    if not dom.get("bids"):
+        dom["bids"] = depth_bids
+        dom["asks"] = depth_asks
+    # Depth imbalance
+    bid_vol = sum(b.get("volume", 0) for b in dom["bids"][:5])
+    ask_vol = sum(a.get("volume", 0) for a in dom["asks"][:5])
+    total = bid_vol + ask_vol
+    dom["bid_pressure_5"] = round(bid_vol / total * 100, 1) if total else 50.0
+    dom["ask_pressure_5"] = round(ask_vol / total * 100, 1) if total else 50.0
+    dom["depth_bias"] = "BUY" if dom["bid_pressure_5"] > dom["ask_pressure_5"] + 5 else "SELL" if dom["ask_pressure_5"] > dom["bid_pressure_5"] + 5 else "NEUTRAL"
+    return dom
+
+T("market_depth", lambda args: market_depth(
+    _mt5_direct, args.get("symbol","EURUSD"), int(args.get("levels",15))),
+  "Orderbook depth: stacked bids/asks con volumen en cada nivel. Ve donde esta el dinero real, las paredes de compra/venta, el imbalance.",
+  {"symbol":{"type":"string","default":"EURUSD"},"levels":{"type":"integer","default":15}})
+
+# ── Volatility Report ────────────────────────────────────────────────────
+def volatility_report(client, symbol="EURUSD"):
+    """Complete volatility analysis: ATR, Bollinger width, HV, regime, entry zones."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    pip = 0.0001 if "JPY" not in symbol else 0.01
+    for tf, tfname, period in [("M5", "M5", 14), ("M15", "M15", 14), ("H1", "H1", 14), ("H4", "H4", 14)]:
+        try:
+            data = _candles(client, symbol, tf, period + 5)
+            candles = data.get("candles", [])
+            if len(candles) < period:
+                continue
+            highs = np.array([c["high"] for c in candles[-period:]])
+            lows = np.array([c["low"] for c in candles[-period:]])
+            closes = np.array([c["close"] for c in candles[-period:]])
+            # ATR
+            prev_close = np.roll(closes, 1)
+            prev_close[0] = closes[0]
+            tr = np.maximum(highs[1:] - lows[1:],
+                 np.maximum(np.abs(highs[1:] - closes[:-1]),
+                            np.abs(lows[1:] - closes[:-1])))
+            atr = float(np.mean(tr)) if len(tr) > 0 else 0
+            atr_pips = round(atr / pip, 1)
+            # Bollinger Width
+            mean = float(np.mean(closes))
+            std = float(np.std(closes))
+            bb_width = round((std * 4) / mean * 100, 2) if mean else 0
+            bb_upper = round(mean + 2 * std, 5)
+            bb_lower = round(mean - 2 * std, 5)
+            # HV (daily)
+            returns = np.diff(np.log(closes + 1e-10))
+            hv = float(np.std(returns) * np.sqrt(252)) if len(returns) > 1 else 0
+            # Regime
+            if bb_width < 2:
+                regime = "squeeze"
+            elif hv > 0.5:
+                regime = "high_vol"
+            elif bb_width < 5 and hv < 0.2:
+                regime = "quiet"
+            else:
+                regime = "normal"
+            current = float(closes[-1])
+            entry_zone = {
+                "long_zone": round(bb_lower + (current - bb_lower) * 0.3, 5),
+                "short_zone": round(bb_upper - (bb_upper - current) * 0.3, 5),
+                "bb_upper": bb_upper,
+                "bb_lower": bb_lower,
+                "bb_mid": round(mean, 5),
+            }
+            result[tfname] = {
+                "atr": round(atr, 5), "atr_pips": atr_pips,
+                "bb_width_pct": bb_width, "regime": regime,
+                "hv": round(hv, 3), "entry": entry_zone,
+            }
+        except Exception as e:
+            result[tfname] = {"error": str(e)}
+    # Overall volatility verdict
+    verdict = "no_data"
+    for tf in ["H4", "H1", "M15", "M5"]:
+        if tf in result and "regime" in result[tf]:
+            verdict = result[tf]["regime"]
+            break
+    result["vol_regime"] = verdict
+    result["advice"] = {
+        "squeeze": "ESTALLO INMINENTE — preparar entrada direccional",
+        "high_vol": "VOLATIL ALTA — usar SL amplio, esperar pullback",
+        "normal": "VOLATIL NORMAL — operar con niveles clave",
+        "quiet": "MERCADO PLANO — esperar breakout, scalping dentro del rango",
+    }.get(verdict, "Esperar señal clara")
+    # Best timeframe to trade
+    result["best_tf"] = "M15" if verdict == "high_vol" else "H1" if verdict == "normal" else "M5" if verdict == "squeeze" else "H1"
+    return result
+
+T("volatility_report", lambda args: volatility_report(
+    _mt5_direct, args.get("symbol","EURUSD")),
+  "Volatilidad completa: ATR, Bollinger, HV, regime, entry zones por timeframe. Sabe si explota, esta quieto, o normal.",
+  {"symbol":{"type":"string","default":"EURUSD"}})
+
+# ── Sell Pressure Analysis ────────────────────────────────────────────────
+def sell_pressure(client, symbol="EURUSD"):
+    """Sell-side pressure: shorts clustering, sell walls, distribution, bearish divergence."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    sym = _fix(symbol)
+    pip = 0.0001 if "JPY" not in symbol else 0.01
+    # Get market data
+    price = _price(client, symbol)
+    bid = price.get("bid", 0)
+    ask = price.get("ask", 0)
+    spread = price.get("spread", 0)
+    result["price"] = {"bid": bid, "ask": ask, "spread": spread}
+    # Candles for analysis
+    candles_m1 = _candles(client, symbol, "M1", 60).get("candles", [])
+    candles_h1 = _candles(client, symbol, "H1", 48).get("candles", [])
+    candles_d1 = _candles(client, symbol, "D1", 30).get("candles", [])
+    # 1. Sell volume analysis
+    sell_vol_m1 = 0
+    buy_vol_m1_est = 0
+    if candles_m1:
+        for c in candles_m1[-20:]:
+            vol = c.get("tick_volume", c.get("volume", 0))
+            oc_range = c["open"] - c["close"]
+            if oc_range > 0:  # bearish candle
+                sell_vol_m1 += vol
+            else:
+                buy_vol_m1_est += vol
+        result["sell_volume_20m"] = sell_vol_m1
+        result["buy_volume_20m_est"] = buy_vol_m1_est
+        total_vol = sell_vol_m1 + buy_vol_m1_est
+        result["sell_pressure_20m"] = round(sell_vol_m1 / total_vol * 100, 1) if total_vol else 50.0
+    # 2. Distribution pattern
+    dist_count = 0
+    if candles_h1:
+        for c in candles_h1[-12:]:
+            oc_range = c["close"] - c["open"]
+            upper_w = c["high"] - max(c["open"], c["close"])
+            lower_w = min(c["open"], c["close"]) - c["low"]
+            # Distribution: upper wick + close in lower half
+            if upper_w > lower_w * 2 and oc_range < 0:
+                dist_count += 1
+        result["distribution_candles_12h"] = dist_count
+        result["distribution_signal"] = dist_count >= 3
+    # 3. Bearish divergence
+    div_signal = False
+    if candles_h1 and len(candles_h1) >= 24:
+        closes = [c["close"] for c in candles_h1[-24:]]
+        highs = [c["high"] for c in candles_h1[-24:]]
+        rsi14 = []
+        for i in range(14, len(highs)):
+            gains = sum(max(0, closes[j] - closes[j-1]) for j in range(i-13, i+1))
+            losses = sum(max(0, closes[j-1] - closes[j]) for j in range(i-13, i+1))
+            if losses == 0:
+                rsi14.append(100)
+            else:
+                rs = gains / losses
+                rsi14.append(100 - 100 / (1 + rs))
+        if len(rsi14) >= 5:
+            # Price higher high, RSI lower high = bearish div
+            recent_high = max(closes[-5:])
+            recent_high_idx = closes[-5:].index(recent_high)
+            if recent_high_idx > 0 and recent_high_idx < 4:
+                if rsi14[-(5 - recent_high_idx)] > rsi14[-1]:
+                    div_signal = True
+                    result["bearish_divergence"] = "H1 price high + RSI lower high"
+    result["bearish_divergence"] = result.get("bearish_divergence", "none")
+    # 4. Trend context
+    if candles_d1 and len(candles_d1) >= 5:
+        d1_closes = [c["close"] for c in candles_d1[-5:]]
+        result["d1_trend"] = "BEARISH" if d1_closes[-1] < d1_closes[0] else "BULLISH"
+    # 5. Sell wall estimate
+    try:
+        book = client({"action": "book", "symbol": sym})
+        if "error" not in book and book.get("asks"):
+            top_asks = book["asks"][:5]
+            avg_ask_vol = sum(a.get("volume", 0) for a in top_asks) / len(top_asks)
+            max_ask_vol = max(a.get("volume", 0) for a in top_asks)
+            result["sell_wall_asks"] = len([a for a in top_asks if a.get("volume", 0) >= avg_ask_vol * 2])
+    except:
+        pass
+    # 6. Final sell verdict
+    factors = 0
+    reasons = []
+    if result.get("sell_pressure_20m", 50) > 60:
+        factors += 1; reasons.append(f"sell_vol_{result['sell_pressure_20m']:.0f}%")
+    if result.get("distribution_signal"):
+        factors += 1; reasons.append(f"distribution({result['distribution_candles_12h']}h)")
+    if result.get("bearish_divergence") != "none":
+        factors += 1; reasons.append("bearish_div")
+    if result.get("d1_trend") == "BEARISH":
+        factors += 1; reasons.append("d1_bearish")
+    if result.get("sell_wall_asks", 0) > 1:
+        factors += 1; reasons.append("sell_wall")
+    result["sell_strength"] = min(100, factors * 20 + 50) if factors else 0
+    result["sell_signal"] = result["sell_strength"] >= 60
+    result["sell_reasons"] = reasons
+    if result["sell_strength"] >= 80:
+        result["advice"] = f"🔥 SELL PRESSURE HIGH ({factors}/5 factores) — priorizar ventas"
+    elif result["sell_strength"] >= 60:
+        result["advice"] = f"⚡ Presion vendedora ({factors}/5) — considerar short"
+    elif result["sell_strength"] >= 30:
+        result["advice"] = f"Moderada. {', '.join(reasons) if reasons else 'Esperar confirmacion'}"
+    else:
+        result["advice"] = "✅ Sin presion vendedora significativa"
+    return result
+
+T("sell_pressure", lambda args: sell_pressure(
+    _mt5_direct, args.get("symbol","EURUSD")),
+  "Presion vendedora total: volumen sell, distribucion, divergencia bajista, sell walls, tendencia D1. Saber si los vendedores dominan.",
   {"symbol":{"type":"string","default":"EURUSD"}})
 
 

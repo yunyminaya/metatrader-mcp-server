@@ -2349,7 +2349,80 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         result["smart_money_map"] = {"error": str(e)}
     
-    # 5. BG DAEMON STATE (latest pre-computed context)
+    # 5. BROKER SERVER (ping, data freshness, connection)
+    try:
+        from mt5_mcp_intelligence import broker_server_status
+        bss = broker_server_status(_mt5_direct, symbol)
+        result["broker_server"] = {
+            "ping_ms": bss.get("ping_ms"),
+            "data_freshness": bss.get("data_freshness"),
+            "server_quality": bss.get("server_quality"),
+            "spread_health": bss.get("spread_health"),
+            "server": bss.get("server"),
+            "connection": bss.get("connection"),
+            "advice": bss.get("advice"),
+        }
+    except Exception as e:
+        result["broker_server"] = {"error": str(e)}
+    
+    # 6. MARKET DEPTH (DOM, bid/ask stacking, walls)
+    try:
+        from mt5_mcp_intelligence import market_depth
+        md = market_depth(_mt5_direct, symbol)
+        result["market_depth"] = {
+            "bid": md.get("bid"),
+            "ask": md.get("ask"),
+            "spread": md.get("spread"),
+            "avg_volume_5m": md.get("avg_volume_5m"),
+            "bid_pressure_5": md.get("bid_pressure_5"),
+            "ask_pressure_5": md.get("ask_pressure_5"),
+            "depth_bias": md.get("depth_bias"),
+            "real_book": md.get("real_book"),
+            "bids": md.get("bids", [])[:5],
+            "asks": md.get("asks", [])[:5],
+        }
+    except Exception as e:
+        result["market_depth"] = {"error": str(e)}
+    
+    # 7. VOLATILITY REPORT (ATR, Bollinger, regime)
+    try:
+        from mt5_mcp_intelligence import volatility_report
+        vr = volatility_report(_mt5_direct, symbol)
+        result["volatility"] = {
+            "regime": vr.get("vol_regime"),
+            "best_tf": vr.get("best_tf"),
+            "advice": vr.get("advice"),
+        }
+        for tf in ["M5", "M15", "H1", "H4"]:
+            if tf in vr:
+                result["volatility"][tf] = {
+                    "atr_pips": vr[tf].get("atr_pips"),
+                    "bb_width_pct": vr[tf].get("bb_width_pct"),
+                    "regime": vr[tf].get("regime"),
+                    "entry_zones": vr[tf].get("entry"),
+                }
+    except Exception as e:
+        result["volatility"] = {"error": str(e)}
+    
+    # 8. SELL PRESSURE (sell volume, distribution, divergence)
+    try:
+        from mt5_mcp_intelligence import sell_pressure
+        sp = sell_pressure(_mt5_direct, symbol)
+        result["sell_pressure"] = {
+            "strength": sp.get("sell_strength"),
+            "signal": sp.get("sell_signal"),
+            "reasons": sp.get("sell_reasons"),
+            "sell_vol_20m": sp.get("sell_pressure_20m"),
+            "distribution": sp.get("distribution_signal"),
+            "sell_walls": sp.get("sell_wall_asks"),
+            "bearish_div": sp.get("bearish_divergence"),
+            "d1_trend": sp.get("d1_trend"),
+            "advice": sp.get("advice"),
+        }
+    except Exception as e:
+        result["sell_pressure"] = {"error": str(e)}
+    
+    # 9. BG DAEMON STATE (latest pre-computed context)
     bg_file = Path(__file__).parent / "data" / "bg_state.json"
     if bg_file.exists():
         try:
@@ -2363,23 +2436,48 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
         except:
             pass
     
-    # 6. FINAL VERDICT — mejor accion AHORA
+    # 10. FINAL VERDICT — mejor accion AHORA (+ sell_pressure + vol + broker_server)
     rec = result.get("market_brain", {}).get("recommendation", {})
-    broker_ok = result.get("broker_trust", 0) or 0 > 40
+    broker_ok = (result.get("broker_trust", 0) or 0) > 40
     edge = result.get("edge", 0) or 0
+    server_ok = (result.get("broker_server", {}).get("server_quality", 0) or 0) >= 40
+    sell_strength = result.get("sell_pressure", {}).get("strength", 0) or 0
+    vol_regime = result.get("volatility", {}).get("regime", "normal")
+    depth_bias = result.get("market_depth", {}).get("depth_bias", "NEUTRAL")
     
-    if rec and rec.get("action") in ("BUY", "SELL") and edge >= 60 and broker_ok:
-        result["verdict"] = f"✅ {rec['action']} {symbol} | Edge {edge}% | SL: {rec.get('sl','?')} | TP: {rec.get('tp','?')} | {rec.get('reason','')}"
+    # Build rich verdict
+    flags = []
+    sell_aligns = (rec.get("action") == "SELL" and sell_strength >= 60) or \
+                  (rec.get("action") == "BUY" and sell_strength < 40)
+    vol_ok = vol_regime not in ("no_data",)
+    depth_aligns = (rec.get("action") == "SELL" and depth_bias == "SELL") or \
+                   (rec.get("action") == "BUY" and depth_bias == "BUY")
+    
+    if rec.get("action") == "SELL":
+        if sell_strength >= 80: flags.append(f"🔥sell_{sell_strength}%")
+        elif sell_strength >= 60: flags.append(f"⚡sell_{sell_strength}%")
+    if server_ok and result.get("broker_server", {}).get("advice") == "TRADE": flags.append("server_OK")
+    elif not server_ok: flags.append("server_BAD")
+    if vol_regime == "squeeze": flags.append("💥squeeze")
+    elif vol_regime == "high_vol": flags.append("🌊high_vol")
+    if depth_aligns: flags.append(f"depth_{depth_bias.lower()}")
+    
+    if rec and rec.get("action") in ("BUY", "SELL") and edge >= 60 and broker_ok and server_ok:
+        result["verdict"] = f"✅ {rec['action']} {symbol} | Edge {edge}% | SL: {rec.get('sl','?')} | TP: {rec.get('tp','?')} | {' | '.join(flags) if flags else rec.get('reason','')}"
         result["action"] = rec["action"]
         result["entry"] = rec.get("entry")
         result["sl"] = rec.get("sl")
         result["tp"] = rec.get("tp")
+        result["confidence"] = min(100, int(edge * (1.1 if sell_aligns else 1.0) * (1.1 if depth_aligns else 1.0)))
     elif rec and rec.get("action") in ("BUY", "SELL"):
-        result["verdict"] = f"⚠️ {rec['action']} {symbol} | Edge solo {edge}% | Esperar mejor confirmacion"
+        result["verdict"] = f"⚠️ {rec['action']} {symbol} | Edge {edge}% | {' | '.join(flags)} | Esperar confirmacion"
         result["action"] = "WATCH"
+        result["confidence"] = int(edge * 0.5)
     else:
-        result["verdict"] = f"⏸️ SKIP {symbol} | Edge {edge}% | Broker trust {result.get('broker_trust', '?')} | {rec.get('reason','')}" if rec else f"⏸️ SKIP — sin senal clara"
+        result["verdict"] = f"⏸️ SKIP | Edge {edge}% | {' | '.join(flags)}" if flags else \
+                          f"⏸️ SKIP — sin senal clara"
         result["action"] = "SKIP"
+        result["confidence"] = 0
     
     return result
 
