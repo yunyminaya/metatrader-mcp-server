@@ -2422,7 +2422,90 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         result["sell_pressure"] = {"error": str(e)}
     
-    # 9. BG DAEMON STATE (latest pre-computed context)
+    # 9. ORDER FLOW (delta, absorption)
+    try:
+        from mt5_mcp_intelligence import order_flow
+        of = order_flow(_mt5_direct, symbol)
+        result["order_flow"] = {
+            "delta_rate": of.get("delta_rate"),
+            "buy_pct": of.get("buy_pct"),
+            "sell_pct": of.get("sell_pct"),
+            "absorption": of.get("absorption"),
+            "flow_bias": of.get("flow_bias"),
+        }
+    except Exception as e:
+        result["order_flow"] = {"error": str(e)}
+    
+    # 10. CORRELATION MAP (matrix, leaders, divergences)
+    try:
+        from mt5_mcp_intelligence import correlation_map
+        cm = correlation_map(_mt5_direct)
+        result["correlation_map"] = {
+            "divergences": cm.get("divergences", []),
+            "leaders": cm.get("leaders", []),
+            "usd_index": cm.get("usd_synthetic_index"),
+        }
+    except Exception as e:
+        result["correlation_map"] = {"error": str(e)}
+    
+    # 11. TRADE COPILOT (in-position advice)
+    try:
+        from mt5_mcp_intelligence import trade_copilot
+        tc = trade_copilot(_mt5_direct, symbol)
+        result["trade_copilot"] = {
+            "in_position": tc.get("in_position"),
+            "position": tc.get("position"),
+            "sl_advice": tc.get("sl_advice"),
+            "partial_tp": tc.get("partial_tp"),
+            "trailing_advice": tc.get("trailing_advice"),
+            "add_advice": tc.get("add_advice"),
+        }
+    except Exception as e:
+        result["trade_copilot"] = {"error": str(e)}
+    
+    # 12. MOMENTUM SHIFT (velocity, acceleration, reversal)
+    try:
+        from mt5_mcp_intelligence import momentum_shift
+        ms = momentum_shift(_mt5_direct, symbol)
+        result["momentum_shift"] = {
+            "velocity_pips_1m": ms.get("velocity_pips_1m"),
+            "acceleration_pips": ms.get("acceleration_pips"),
+            "momentum": ms.get("momentum"),
+            "shift_warning": ms.get("shift_warning"),
+            "rsi_warning": ms.get("rsi_warning"),
+        }
+    except Exception as e:
+        result["momentum_shift"] = {"error": str(e)}
+    
+    # 13. POSITION SIZING KELLY
+    try:
+        from mt5_mcp_intelligence import position_sizing_kelly
+        ps = position_sizing_kelly(_mt5_direct, symbol, edge_pct=result.get("edge"), bankroll=result.get("balance"))
+        result["position_sizing"] = {
+            "optimal_lot": ps.get("optimal_lot"),
+            "risk_usd": ps.get("risk_usd"),
+            "sl_pips": ps.get("sl_pips"),
+            "reward_1to2": ps.get("reward_1to2_tp_pips"),
+            "reward_1to3": ps.get("reward_1to3_tp_pips"),
+            "guide": ps.get("sizing_guide"),
+        }
+    except Exception as e:
+        result["position_sizing"] = {"error": str(e)}
+    
+    # 14. LIQUIDITY HEATMAP (volume pools, support/resistance)
+    try:
+        from mt5_mcp_intelligence import liquidity_heatmap
+        lh = liquidity_heatmap(_mt5_direct, symbol)
+        result["liquidity_heatmap"] = {
+            "pools": lh.get("liquidity_pools", []),
+            "support": lh.get("support"),
+            "resistance": lh.get("resistance"),
+            "liquidity_near": lh.get("liquidity_near_assessment"),
+        }
+    except Exception as e:
+        result["liquidity_heatmap"] = {"error": str(e)}
+    
+    # 15. BG DAEMON STATE (latest pre-computed context)
     bg_file = Path(__file__).parent / "data" / "bg_state.json"
     if bg_file.exists():
         try:
@@ -2436,7 +2519,7 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
         except:
             pass
     
-    # 10. FINAL VERDICT — mejor accion AHORA (+ sell_pressure + vol + broker_server)
+    # 16. FINAL VERDICT — mejor accion AHORA (+ order_flow + momentum + todo)
     rec = result.get("market_brain", {}).get("recommendation", {})
     broker_ok = (result.get("broker_trust", 0) or 0) > 40
     edge = result.get("edge", 0) or 0
@@ -2444,6 +2527,10 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
     sell_strength = result.get("sell_pressure", {}).get("strength", 0) or 0
     vol_regime = result.get("volatility", {}).get("regime", "normal")
     depth_bias = result.get("market_depth", {}).get("depth_bias", "NEUTRAL")
+    flow_bias = result.get("order_flow", {}).get("flow_bias", "NEUTRAL")
+    momentum = result.get("momentum_shift", {}).get("momentum", "")
+    accel = result.get("momentum_shift", {}).get("acceleration_pips", 0) or 0
+    divs = result.get("correlation_map", {}).get("divergences", [])
     
     # Build rich verdict
     flags = []
@@ -2452,6 +2539,8 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
     vol_ok = vol_regime not in ("no_data",)
     depth_aligns = (rec.get("action") == "SELL" and depth_bias == "SELL") or \
                    (rec.get("action") == "BUY" and depth_bias == "BUY")
+    flow_aligns = (rec.get("action") == "SELL" and flow_bias == "SELL") or \
+                  (rec.get("action") == "BUY" and flow_bias == "BUY")
     
     if rec.get("action") == "SELL":
         if sell_strength >= 80: flags.append(f"🔥sell_{sell_strength}%")
@@ -2461,6 +2550,20 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
     if vol_regime == "squeeze": flags.append("💥squeeze")
     elif vol_regime == "high_vol": flags.append("🌊high_vol")
     if depth_aligns: flags.append(f"depth_{depth_bias.lower()}")
+    if flow_aligns: flags.append(f"flow_{flow_bias.lower()}")
+    if "reversal" in momentum.lower(): flags.append("⚡reversal")
+    if divs:
+        for d in divs[:1]:
+            flags.append(f"div_{d.get('pair','').replace('/','_')}")
+    
+    # Confianza total
+    conf_factors = [edge]
+    if broker_ok: conf_factors.append(10)
+    if server_ok: conf_factors.append(10)
+    if sell_aligns: conf_factors.append(10)
+    if depth_aligns: conf_factors.append(10)
+    if flow_aligns: conf_factors.append(15)
+    total_conf = min(100, int(sum(conf_factors) / len(conf_factors))) if conf_factors else edge
     
     if rec and rec.get("action") in ("BUY", "SELL") and edge >= 60 and broker_ok and server_ok:
         result["verdict"] = f"✅ {rec['action']} {symbol} | Edge {edge}% | SL: {rec.get('sl','?')} | TP: {rec.get('tp','?')} | {' | '.join(flags) if flags else rec.get('reason','')}"
@@ -2468,7 +2571,7 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
         result["entry"] = rec.get("entry")
         result["sl"] = rec.get("sl")
         result["tp"] = rec.get("tp")
-        result["confidence"] = min(100, int(edge * (1.1 if sell_aligns else 1.0) * (1.1 if depth_aligns else 1.0)))
+        result["confidence"] = total_conf
     elif rec and rec.get("action") in ("BUY", "SELL"):
         result["verdict"] = f"⚠️ {rec['action']} {symbol} | Edge {edge}% | {' | '.join(flags)} | Esperar confirmacion"
         result["action"] = "WATCH"
@@ -2477,6 +2580,7 @@ def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
         result["verdict"] = f"⏸️ SKIP | Edge {edge}% | {' | '.join(flags)}" if flags else \
                           f"⏸️ SKIP — sin senal clara"
         result["action"] = "SKIP"
+        result["confidence"] = 0
         result["confidence"] = 0
     
     return result

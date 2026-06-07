@@ -2539,8 +2539,401 @@ T("sell_pressure", lambda args: sell_pressure(
   "Presion vendedora total: volumen sell, distribucion, divergencia bajista, sell walls, tendencia D1. Saber si los vendedores dominan.",
   {"symbol":{"type":"string","default":"EURUSD"}})
 
+# ── Order Flow (Delta) ────────────────────────────────────────────────────
+def order_flow(client, symbol="EURUSD", lookback=50):
+    """Order flow: delta, cumulative delta, bid/ask volume, absorption. Ve el dinero entrando en tiempo real."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    try:
+        ticks = client({"action": "live_ticks", "symbol": _fix(symbol), "count": lookback})
+        tick_list = ticks.get("ticks", ticks.get("result", []))
+        if not tick_list or isinstance(tick_list, dict):
+            tick_list = []
+        if not tick_list:
+            candles = _candles(client, symbol, "M1", 15).get("candles", [])
+            bid_count, ask_count = 0, 0
+            for c in candles:
+                vol = c.get("tick_volume", c.get("volume", 1)) or 1
+                delta = c.get("close", 0) - c.get("open", 0)
+                if delta > 0: bid_count += vol
+                elif delta < 0: ask_count += vol
+            total = bid_count + ask_count
+            result["delta_rate"] = round((bid_count - ask_count) / max(total, 1) * 100, 1)
+            result["buy_pct"] = round(bid_count / total * 100, 1) if total else 0
+            result["sell_pct"] = round(ask_count / total * 100, 1) if total else 0
+            result["source"] = "candle_estimate"
+        else:
+            bid_vol, ask_vol = 0, 0
+            for t in tick_list:
+                flag = t.get("flags", t.get("type", 0))
+                vol = t.get("volume", 1)
+                if flag in (0, 4, 6): bid_vol += vol
+                elif flag in (1, 5, 7): ask_vol += vol
+            total = bid_vol + ask_vol
+            result["bid_volume"] = bid_vol
+            result["ask_volume"] = ask_vol
+            result["delta"] = bid_vol - ask_vol
+            result["delta_rate"] = round((bid_vol - ask_vol) / max(total, 1) * 100, 1)
+            result["buy_pct"] = round(bid_vol / total * 100, 1) if total else 0
+            result["sell_pct"] = round(ask_vol / total * 100, 1) if total else 0
+            result["source"] = "real_ticks"
+        # Absorption detection
+        dp = result.get("delta_rate", 0)
+        if abs(dp) < 5 and total > 20:
+            result["absorption"] = "DETECTADA — big money entrando sin mover precio"
+        elif abs(dp) > 40:
+            result["absorption"] = "AGRESIVA — direccion clara, seguir flujo"
+        else:
+            result["absorption"] = "normal"
+        # Verdict
+        dp_v = result.get("delta_rate", 0)
+        result["flow_bias"] = "BUY" if dp_v > 15 else "SELL" if dp_v < -15 else "NEUTRAL"
+    except Exception as e:
+        result["error"] = str(e)
+    return result
 
-# Need _mt5_direct reference from the main server
+T("order_flow", lambda args: order_flow(
+    _mt5_direct, args.get("symbol","EURUSD"), int(args.get("lookback",50))),
+  "Order flow real: delta, cumulative delta, bid/ask volume, absorption. Ve el dinero institucional entrando ANTES del movimiento.",
+  {"symbol":{"type":"string","default":"EURUSD"},"lookback":{"type":"integer","default":50}})
+
+# ── Correlation Map ──────────────────────────────────────────────────────
+def correlation_map(client, symbols=None):
+    """Full correlation matrix of all pairs. Detects divergence, leaders, regime shifts."""
+    if symbols is None:
+        symbols = ["EURUSD","GBPUSD","USDJPY","USDCAD","AUDUSD","NZDUSD","USDCHF","EURGBP","EURJPY"]
+    result = {"timestamp": datetime.now(timezone.utc).isoformat()}
+    prices = {}
+    for s in symbols:
+        try:
+            p = _price(client, s)
+            prices[s] = p.get("bid", 0)
+        except:
+            prices[s] = 0
+    result["prices"] = prices
+    # Fetch candles for correlation
+    all_closes = {}
+    for s in symbols:
+        try:
+            c = _candles(client, s, "H1", 24).get("candles", [])
+            all_closes[s] = [x["close"] for x in c[-24:]]
+        except:
+            all_closes[s] = []
+    # Correlation matrix
+    matrix = {}
+    for s1 in symbols:
+        matrix[s1] = {}
+        for s2 in symbols:
+            if s1 == s2:
+                matrix[s1][s2] = 1.0
+                continue
+            c1, c2 = all_closes.get(s1, []), all_closes.get(s2, [])
+            if len(c1) < 5 or len(c2) < 5:
+                matrix[s1][s2] = 0
+                continue
+            min_l = min(len(c1), len(c2))
+            c1, c2 = c1[-min_l:], c2[-min_l:]
+            r = np.corrcoef(c1, c2)[0][1]
+            matrix[s1][s2] = round(float(r), 2)
+    result["matrix"] = matrix
+    # Divergence detection: pairs that should move together but don't
+    divergences = []
+    high_corr_pairs = [("EURUSD","GBPUSD"),("EURUSD","EURGBP"),("AUDUSD","NZDUSD"),
+                       ("USDJPY","USDCAD"),("EURJPY","GBPJPY")]
+    for p1, p2 in high_corr_pairs:
+        if p1 in symbols and p2 in symbols:
+            corr = matrix.get(p1, {}).get(p2, 0)
+            if abs(corr) < 0.3:
+                divergences.append({"pair": f"{p1}/{p2}", "correlation": corr, "signal": "DIVERGENCIA — una va a moverse"})
+            elif corr < 0.6:
+                divergences.append({"pair": f"{p1}/{p2}", "correlation": corr, "signal": "debilitandose"})
+    result["divergences"] = divergences
+    # Leading pair detection (which moved first)
+    leaders = []
+    if all_closes:
+        changes = {s: (prices[s] - all_closes.get(s, [prices[s]])[0]) / max(all_closes.get(s, [prices[s]])[0], 0.0001) for s in symbols if prices.get(s) and all_closes.get(s)}
+        sorted_chgs = sorted(changes.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+        leaders = [{"symbol": s, "change_pct": round(c * 100, 2)} for s, c in sorted_chgs if abs(c) > 0.0005]
+    result["leaders"] = leaders
+    # USD index (synthetic)
+    usd_pairs = [s for s in symbols if s.startswith("USD") or s.endswith("USD")]
+    usd_values = [prices.get(s, 0) for s in usd_pairs if prices.get(s)]
+    result["usd_synthetic_index"] = round(sum(usd_values) / len(usd_values), 5) if usd_values else 0
+    return result
+
+T("correlation_map", lambda args: correlation_map(
+    _mt5_direct, args.get("symbols", None)),
+  "Mapa de correlacion completo: matriz 9x9, divergencias entre pares, lideres de movimiento, USD index. Ve quien mueve el mercado.",
+  {"symbols":{"type":"array","items":{"type":"string"},"default":["EURUSD","GBPUSD","USDJPY","USDCAD","AUDUSD","NZDUSD","USDCHF","EURGBP","EURJPY"]}})
+
+# ── Trade Copilot ─────────────────────────────────────────────────────────
+def trade_copilot(client, symbol="EURUSD"):
+    """In-trade intelligence: SL/TP placement, trailing activation, partial exits, add-to-winner."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    pip = 0.0001 if "JPY" not in symbol else 0.01
+    # Get position
+    pos = _positions(client, symbol)
+    pos_list = pos.get("positions", [])
+    open_pos = None
+    if isinstance(pos_list, list):
+        for p in pos_list:
+            if isinstance(p, dict) and p.get("symbol", "").replace(".FX", "") == symbol.replace(".FX", ""):
+                open_pos = p; break
+    elif isinstance(pos_list, dict) and pos_list.get("symbol", "").replace(".FX", "") == symbol.replace(".FX", ""):
+        open_pos = pos_list
+    result["in_position"] = open_pos is not None
+    # Price data
+    price = _price(client, symbol)
+    bid = price.get("bid", 0)
+    ask = price.get("ask", 0)
+    spreads = price.get("spread", 0)
+    # ATR
+    try:
+        c = _candles(client, symbol, "M15", 20).get("candles", [])
+        if len(c) >= 5:
+            trs = []
+            for i in range(1, len(c)):
+                trs.append(max(c[i]["high"] - c[i]["low"], abs(c[i]["high"] - c[i-1]["close"]), abs(c[i]["low"] - c[i-1]["close"])))
+            atr = sum(trs[-14:]) / min(14, len(trs)) if trs else 0.001
+            atr_pips = atr / pip
+        else:
+            atr, atr_pips = 0.001, 0.5
+    except:
+        atr, atr_pips = 0.001, 0.5
+    result["atr_pips"] = round(atr_pips, 1)
+    result["spread"] = spreads
+    if open_pos:
+        tp = open_pos.get("tp", 0)
+        sl = open_pos.get("sl", 0)
+        pos_type = open_pos.get("type", "buy")
+        pos_vol = open_pos.get("volume", 0.01)
+        open_price = open_pos.get("price", 0)
+        profit = open_pos.get("profit", 0)
+        is_buy = pos_type in (0, "buy")
+        current = bid if is_buy else ask
+        pips_run = abs(current - open_price) / pip
+        result["position"] = {"type": "BUY" if is_buy else "SELL", "volume": pos_vol,
+                              "open": open_price, "current": current, "profit": round(profit, 2),
+                              "pips_run": round(pips_run, 1)}
+        # SL advice: move to breakeven?
+        if pips_run >= atr_pips * 1.5 and profit > 0:
+            be_price = open_price + (pip * 2 if is_buy else -pip * 2)
+            result["sl_advice"] = f"✅ MOVER SL A BREAKEVEN ({round(be_price,5)}) — {round(pips_run,1)}pips ganados"
+            result["sl_target"] = round(be_price, 5)
+        elif pips_run >= atr_pips * 0.8:
+            be_price = open_price + (pip * 1 if is_buy else -pip * 1)
+            result["sl_advice"] = f"⚠️ SL TIGHT -> {round(be_price,5)} proteger ganancia"
+            result["sl_target"] = round(be_price, 5)
+        else:
+            result["sl_advice"] = f"⏸️ Mantener SL original. Solo {round(pips_run,1)}pips corridos (objetivo {round(atr_pips*1.5,1)} para mover)"
+        # Partial TP advice
+        if profit > 0:
+            result["partial_tp"] = f"💰 Tomar 50% en +{round(atr_pips*1.5,1)} pips ({round(open_price + (atr*1.5 if is_buy else -atr*1.5),5)})"
+        # Trail activation
+        if pips_run >= atr_pips * 1.2:
+            result["trailing_advice"] = f"🏃 ACTIVAR TRAILING — step {round(atr*0.3,5)} distancia {round(atr*0.7,5)}"
+        else:
+            result["trailing_advice"] = f"Esperar +{round(atr_pips*1.2 - pips_run,1)}pips para trailing"
+        # Add to winner?
+        if profit > 0 and pips_run >= atr_pips * 0.5:
+            add_price = current + (pip * 3 if is_buy else -pip * 3)
+            result["add_advice"] = f"📈 ADD en pullback a {round(add_price,5)} con SL conjunto"
+    else:
+        result["sl_advice"] = "Sin posicion abierta"
+        result["position"] = None
+        # Entry suggestion
+        result["entry_suggestion"] = f"Entrar en direccion de delta/flujo. SL {round(atr_pips*1.5,1)}pips. TP {round(atr_pips*3,1)}pips."
+    return result
+
+T("trade_copilot", lambda args: trade_copilot(
+    _mt5_direct, args.get("symbol","EURUSD")),
+  "Copiloto de trading: dice cuando mover SL, tomar ganancia parcial, activar trailing, agregar a ganador. Tu asistente en la operacion.",
+  {"symbol":{"type":"string","default":"EURUSD"}})
+
+# ── Momentum Shift ────────────────────────────────────────────────────────
+def momentum_shift(client, symbol="EURUSD"):
+    """Early momentum reversal detection. Tick velocity, acceleration, divergence."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    pip = 0.0001 if "JPY" not in symbol else 0.01
+    # Get recent candles
+    m1 = _candles(client, symbol, "M1", 30).get("candles", [])
+    m5 = _candles(client, symbol, "M5", 12).get("candles", [])
+    if not m1 or len(m1) < 5:
+        result["error"] = "insufficient data"; return result
+    # M1 velocity (pips per minute)
+    velocities = []
+    for i in range(1, len(m1)):
+        vel = (m1[i]["close"] - m1[i-1]["close"]) / pip
+        velocities.append(vel)
+    if len(velocities) < 5:
+        result["error"] = "insufficient ticks"
+        return result
+    recent_v = velocities[-5:]
+    older_v = velocities[-15:-5] if len(velocities) >= 15 else velocities[:-5]
+    avg_recent = sum(recent_v) / len(recent_v)
+    avg_older = sum(older_v) / len(older_v) if older_v else 0
+    result["velocity_pips_1m"] = round(avg_recent, 2)
+    result["velocity_old_pips_1m"] = round(avg_older, 2)
+    # Acceleration
+    accel = avg_recent - avg_older
+    result["acceleration_pips"] = round(accel, 2)
+    # Momentum shift detection
+    if abs(accel) < 0.3:
+        result["momentum"] = "ESTABLE"
+        result["shift_warning"] = "Sin cambio de momentum"
+    elif accel > 0.5 and avg_older < 0:
+        result["momentum"] = "🟢 REVERSIÓN ALCISTA"
+        result["shift_warning"] = "Velocidad cambiando de negativa a positiva — posible reversal UP"
+        result["shift_strength"] = "strong" if accel > 1 else "moderate"
+    elif accel < -0.5 and avg_older > 0:
+        result["momentum"] = "🔴 REVERSIÓN BAJISTA"
+        result["shift_warning"] = "Velocidad cambiando de positiva a negativa — posible reversal DOWN"
+        result["shift_strength"] = "strong" if accel < -1 else "moderate"
+    elif accel > 0.3:
+        result["momentum"] = "🟢 ACELERANDO UP — momentum alcista aumentando"
+        result["shift_warning"] = "Presion compradora aumentando"
+    elif accel < -0.3:
+        result["momentum"] = "🔴 ACELERANDO DOWN — momentum bajista aumentando"
+        result["shift_warning"] = "Presion vendedora aumentando"
+    else:
+        result["momentum"] = "NEUTRAL"
+    # RSI divergence check for M15
+    try:
+        m15 = _candles(client, symbol, "M15", 30).get("candles", [])
+        if len(m15) >= 20:
+            m15_closes = [c["close"] for c in m15[-20:]]
+            m15_highs = [c["high"] for c in m15[-20:]]
+            gains = sum(max(0, m15_closes[i] - m15_closes[i-1]) for i in range(1, 14))
+            losses = sum(max(0, m15_closes[i-1] - m15_closes[i]) for i in range(1, 14))
+            rsi = 50
+            if losses > 0: rsi = 100 - 100 / (1 + gains / losses)
+            if rsi > 70:
+                result["rsi_warning"] = f"RSI {round(rsi,1)} — sobrecompra, posible reversal"
+            elif rsi < 30:
+                result["rsi_warning"] = f"RSI {round(rsi,1)} — sobreventa, posible reversal"
+            else:
+                result["rsi_warning"] = f"RSI {round(rsi,1)} — normal"
+    except:
+        pass
+    return result
+
+T("momentum_shift", lambda args: momentum_shift(
+    _mt5_direct, args.get("symbol","EURUSD")),
+  "Deteccion temprana de reversal: velocity, acceleration, RSI divergence. Sabe cuando el momentum cambia ANTES del precio.",
+  {"symbol":{"type":"string","default":"EURUSD"}})
+
+# ── Position Sizing (Kelly) ──────────────────────────────────────────────
+def position_sizing_kelly(client, symbol="EURUSD", edge_pct=None, bankroll=None, risk_per_trade_pct=2.0):
+    """Optimal position size using Kelly criterion + current volatility + account."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    pip = 0.0001 if "JPY" not in symbol else 0.01
+    # Get real account
+    try:
+        acct = _account(client).get("account", {})
+        balance = bankroll or acct.get("balance", acct.get("equity", 100))
+    except:
+        balance = bankroll or 100
+    result["balance"] = round(balance, 2)
+    # ATR for SL
+    try:
+        c = _candles(client, symbol, "H1", 20).get("candles", [])
+        if len(c) >= 5:
+            trs = [max(c[i]["high"] - c[i]["low"], abs(c[i]["high"] - c[i-1]["close"]), abs(c[i]["low"] - c[i-1]["close"])) for i in range(1, len(c))]
+            atr = sum(trs[-14:]) / min(14, len(trs))
+        else:
+            atr = 0.001
+    except:
+        atr = 0.001
+    sl_pips = atr / pip * 1.5
+    sl_points = int(sl_pips * (10000 if "JPY" not in symbol else 100))
+    # Calculate from edge or default
+    if edge_pct is not None:
+        edge = edge_pct / 100.0
+        kelly_pct = max(0, (edge * 100) / 100)  # simplified
+        kelly_pct = min(kelly_pct, 0.25)  # cap at 25%
+    else:
+        kelly_pct = risk_per_trade_pct / 100.0
+    # Dollar risk
+    risk_per_trade = balance * kelly_pct
+    # Lot size
+    pip_value = balance * 0.0001 * (1 / (pip * 10000))
+    lot_size = risk_per_trade / (sl_pips * 10) if sl_pips > 0 else 0.01
+    lot_size = max(0.01, min(lot_size, 1.0))
+    result["optimal_lot"] = round(lot_size, 2)
+    result["kelly_pct"] = round(kelly_pct * 100, 1)
+    result["risk_usd"] = round(risk_per_trade, 2)
+    result["sl_pips"] = round(sl_pips, 1)
+    result["sl_points"] = sl_points
+    result["reward_1to2_tp_pips"] = round(sl_pips * 2, 1)
+    result["reward_1to3_tp_pips"] = round(sl_pips * 3, 1)
+    result["leverage_used"] = round((lot_size * 100000) / balance, 1) if balance > 0 else 0
+    # Conservative / moderate / aggressive
+    result["sizing_guide"] = {
+        "conservative_lot": round(max(0.01, lot_size * 0.5), 2),
+        "moderate_lot": round(lot_size, 2),
+        "aggressive_lot": round(min(lot_size * 1.5, 1.0), 2),
+    }
+    return result
+
+T("position_sizing_kelly", lambda args: position_sizing_kelly(
+    _mt5_direct, args.get("symbol","EURUSD"), args.get("edge_pct"), args.get("bankroll"), args.get("risk_per_trade", 2.0)),
+  "Tamaño optimo de posicion con Kelly: balance, ATR, riesgo. Te dice exactamente cuanto arriesgar en cada trade.",
+  {"symbol":{"type":"string","default":"EURUSD"},"edge_pct":{"type":"number"},"bankroll":{"type":"number"},"risk_per_trade":{"type":"number","default":2.0}})
+
+# ── Liquidity Heatmap ────────────────────────────────────────────────────
+def liquidity_heatmap(client, symbol="EURUSD", levels=20):
+    """Volume profile: where liquidity clusters at each price level. Ve donde esta el dinero real."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    pip = 0.0001 if "JPY" not in symbol else 0.01
+    # Build volume profile from H1 + M15 candles
+    h1 = _candles(client, symbol, "H1", 48).get("candles", [])
+    m15 = _candles(client, symbol, "M15", 48).get("candles", [])
+    price = _price(client, symbol)
+    bid = price.get("bid", 0)
+    ask = price.get("ask", 0)
+    current = (bid + ask) / 2
+    result["current_price"] = current
+    # Volume clusters
+    if h1:
+        vp = {}
+        for c in h1:
+            vol = c.get("tick_volume", c.get("volume", 0)) or 1
+            price_level = round(c["close"] / pip) * pip
+            vp[price_level] = vp.get(price_level, 0) + vol
+            # Also distribute across range
+            low_lev = round(c["low"] / pip) * pip
+            high_lev = round(c["high"] / pip) * pip
+            if low_lev != price_level or high_lev != price_level:
+                for l in [low_lev, price_level + pip, high_lev]:
+                    vp[l] = vp.get(l, 0) + vol // 3
+        sorted_levels = sorted(vp.items(), key=lambda x: x[1], reverse=True)
+        top5 = [{"price": round(l, 5), "volume": int(v)} for l, v in sorted_levels[:5]]
+        result["liquidity_pools"] = top5
+        result["high_volume_nodes"] = [l for l, v in sorted_levels[:3]]
+    # Support/resistance from volume
+    lps = result.get("liquidity_pools", [])
+    support, resistance = None, None
+    for lp in lps:
+        lp_p = lp["price"]
+        if lp_p < current and (support is None or lp_p > support):
+            support = lp_p
+        if lp_p > current and (resistance is None or lp_p < resistance):
+            resistance = lp_p
+    result["support"] = support
+    result["resistance"] = resistance
+    # Volume near current price
+    near_vol = 0
+    near_range = pip * 5
+    for lp in lps:
+        if abs(lp["price"] - current) < near_range:
+            near_vol += lp["volume"]
+    result["liquidity_near_price"] = near_vol
+    result["liquidity_near_assessment"] = "ALTA — soporte/resistencia fuerte" if near_vol > 10000 else "MODERADA" if near_vol > 3000 else "BAJA — precio libre"
+    return result
+
+T("liquidity_heatmap", lambda args: liquidity_heatmap(
+    _mt5_direct, args.get("symbol","EURUSD"), int(args.get("levels",20))),
+  "Mapa de liquidez: volume profile, high-volume nodes, soporte/resistencia por volumen. Ve donde esta el dinero real y a donde va.",
+  {"symbol":{"type":"string","default":"EURUSD"},"levels":{"type":"integer","default":20}})
 _mt5_direct = None
 
 # Load persistent state on import
