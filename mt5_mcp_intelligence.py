@@ -1687,6 +1687,406 @@ def smart_money_map(mt5_direct_fn, symbol="EURUSD"):
     return result
 
 
+# ── Market Brain: Cerebro de Mercado ──
+
+_BRAIN_CACHE = {"broker_profile": {}, "multi_pair": {}}
+
+def market_brain(mt5_direct_fn, symbol="EURUSD"):
+    """Sistema de visión total. 5 capas: liquidez, huella institucional, flujo multi-par, broker, predicción."""
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    sym = _fix_sym_local(symbol)
+    global _BRAIN_CACHE
+    
+    try:
+        price_raw = mt5_direct_fn({"action": "price", "symbol": sym})
+        m1_raw = mt5_direct_fn({"action": "candles", "symbol": sym, "timeframe": "M1", "count": 500})
+        h1_raw = mt5_direct_fn({"action": "candles", "symbol": sym, "timeframe": "H1", "count": 100})
+        pos_raw = mt5_direct_fn({"action": "positions", "symbol": sym})
+    except Exception as e:
+        return {"error": str(e)}
+    
+    bid = price_raw.get("bid", 0)
+    ask = price_raw.get("ask", 0)
+    spread = price_raw.get("spread", 99)
+    m1 = m1_raw.get("candles", m1_raw.get("data", []))
+    h1 = h1_raw.get("candles", h1_raw.get("data", []))
+    positions = pos_raw.get("positions", [])
+    
+    if not m1 or not h1:
+        return {"error": "insufficient data"}
+    
+    closes = [c["close"] for c in m1]
+    highs = [c["high"] for c in m1]
+    lows = [c["low"] for c in m1]
+    volumes = [c.get("tick_volume", c.get("volume", 0)) for c in m1]
+    spreads = [c.get("spread", spread) for c in m1]
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # LAYER 1: LIQUIDITY MAP
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    pip = 0.01 if "JPY" in symbol else 0.0001
+    
+    # Build liquidity clusters from round numbers + swing points
+    liquidity = {"bid": [], "ask": [], "hot": [], "next_target": None}
+    
+    # Round number liquidity
+    price_range = max(highs[-200:]) - min(lows[-200:]) if len(highs) >= 200 else 0.02
+    step = pip * 5  # 5-pip steps
+    min_p = max(0, bid - price_range * 0.5)
+    max_p = bid + price_range * 0.5
+    
+    level = round(min_p / step) * step
+    while level <= max_p:
+        # Count touches and volume near this level
+        touches = sum(1 for c in m1[-100:] if abs(c["high"] - level) < pip or abs(c["low"] - level) < pip)
+        vol_near = sum(c.get("tick_volume", 0) for c in m1[-100:] if abs(c["high"] - level) < pip*2 or abs(c["low"] - level) < pip*2)
+        
+        if touches > 2 or vol_near > sum(volumes[-100:]) / 20:
+            side = "ask" if level > bid else "bid"
+            density = "high" if touches > 8 else "medium" if touches > 4 else "low"
+            liquidity[side].append({
+                "price": round(level, 5), "touches": touches,
+                "volume_near": int(vol_near), "density": density,
+            })
+        level += step
+    
+    # Identify the hottest level (most volume + touches)
+    for l in liquidity["bid"] + liquidity["ask"]:
+        if l["touches"] > 5 and l["volume_near"] > sum(volumes[-100:]) / 15:
+            liquidity["hot"].append(l)
+    
+    # Predict next hunted level (closest dense liquidity opposite current pressure)
+    recent_mom = (closes[-1] - closes[-5]) / (closes[-5] or 1)
+    if recent_mom > 0:
+        below_bid = [l for l in liquidity["bid"] if l["price"] < bid]
+        next_hunt = max(below_bid, key=lambda x: x["volume_near"]) if below_bid else None
+        liquidity["next_target"] = {
+            "direction": "down", "price": round(next_hunt["price"], 5),
+            "reason": f"{next_hunt['touches']} touches, {next_hunt['volume_near']} volume below"
+        } if next_hunt else {"direction": "down", "price": round(bid - 3*pip, 5), "reason": "no_dense_level"}
+    else:
+        above_ask = [l for l in liquidity["ask"] if l["price"] > bid]
+        next_hunt = min(above_ask, key=lambda x: x["price"]) if above_ask else None
+        liquidity["next_target"] = {
+            "direction": "up", "price": round(next_hunt["price"], 5),
+            "reason": f"{next_hunt['touches']} touches, {next_hunt['volume_near']} volume above"
+        } if next_hunt else {"direction": "up", "price": round(bid + 3*pip, 5), "reason": "no_dense_level"}
+    
+    liquidity["dense_levels"] = sorted(liquidity["hot"], key=lambda x: x["volume_near"], reverse=True)[:5]
+    result["liquidity_map"] = {
+        "bid_levels": liquidity["bid"][-5:] if liquidity["bid"] else [],
+        "ask_levels": liquidity["ask"][:5] if liquidity["ask"] else [],
+        "hottest_levels": liquidity["dense_levels"],
+        "next_target": liquidity["next_target"],
+    }
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # LAYER 2: INSTITUTIONAL FOOTPRINT
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    inst = {"icebergs": [], "absorption": 0, "smart_money_bias": "neutral", "confidence": 0}
+    
+    # Detect iceberg orders: large volume + narrow spread + price not moving = accumulation
+    vol_chunks = []
+    for i in range(0, len(volumes), 10):
+        chunk = sum(volumes[i:i+10])
+        vol_chunks.append(chunk)
+    
+    avg_chunk = sum(vol_chunks[-10:]) / 10 if len(vol_chunks) >= 10 else sum(vol_chunks) / max(len(vol_chunks), 1)
+    recent_high_vol = [i for i, v in enumerate(vol_chunks[-5:]) if v > avg_chunk * 1.5]
+    
+    if recent_high_vol:
+        for idx in recent_high_vol:
+            start_idx = max(0, len(m1) - (5 - idx) * 10)
+            end_idx = min(len(m1), start_idx + 10)
+            seg = m1[start_idx:end_idx]
+            if seg:
+                price_range_seg = max(c["high"] for c in seg) - min(c["low"] for c in seg)
+                vol_seg = sum(c.get("tick_volume", 0) for c in seg)
+                spread_seg = sum(c.get("spread", 0) for c in seg) / len(seg)
+                if price_range_seg < pip * 5 and spread_seg < spread * 0.8:
+                    direction = "unknown"
+                    mid_seg = (max(c["high"] for c in seg) + min(c["low"] for c in seg)) / 2
+                    if mid_seg > bid:
+                        direction = "buying"
+                    elif mid_seg < bid:
+                        direction = "selling"
+                    inst["icebergs"].append({
+                        "direction": direction, "volume_est": int(vol_seg),
+                        "range_pips": round(price_range_seg / (pip or 1), 1),
+                        "price_zone": f"{round(min(c['low'] for c in seg), 5)}-{round(max(c['high'] for c in seg), 5)}",
+                    })
+    
+    # Absorption score
+    buying_volume_50 = sum(volumes[i] for i in range(max(0, len(volumes)-50), len(volumes)) if closes[i] > closes[i-1] if i > 0)
+    selling_volume_50 = sum(volumes[i] for i in range(max(0, len(volumes)-50), len(volumes)) if closes[i] <= closes[i-1] if i > 0)
+    total_v_50 = buying_volume_50 + selling_volume_50
+    absorption_ratio = buying_volume_50 / (selling_volume_50 or 1)
+    
+    # Price change over 50 periods
+    price_change_50 = (closes[-1] - closes[-50]) / (closes[-50] or 1) * 100 if len(closes) >= 50 else 0
+    
+    # Absorption = high volume but little price movement
+    if total_v_50 > sum(volumes[-150:-50]) / 3 and abs(price_change_50) < 0.1:
+        inst["absorption"] = 1
+        inst["smart_money_bias"] = "accumulating" if absorption_ratio > 1.2 else "distributing" if absorption_ratio < 0.8 else "neutral"
+        inst["confidence"] = 75
+    elif total_v_50 > sum(volumes[-150:-50]) / 2:
+        inst["absorption"] = 0.5
+        inst["smart_money_bias"] = "buying" if price_change_50 > 0.15 else "selling" if price_change_50 < -0.15 else "neutral"
+        inst["confidence"] = 55
+    else:
+        inst["absorption"] = 0
+        inst["smart_money_bias"] = price_change_50 > 0.1 and "buying" or price_change_50 < -0.1 and "selling" or "neutral"
+        inst["confidence"] = 30
+    
+    inst["absorption_ratio"] = round(absorption_ratio, 2)
+    inst["price_change_50pct"] = round(price_change_50, 3)
+    inst["buy_vol_50"] = int(buying_volume_50)
+    inst["sell_vol_50"] = int(selling_volume_50)
+    
+    result["institutional_footprint"] = inst
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # LAYER 3: MULTI-PAIR FLOW
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    flow = {"pairs": {}}
+    flow_pairs = ["EURUSD","GBPUSD","USDJPY","USDCAD","AUDUSD","NZDUSD","USDCHF"]
+    
+    for ps in flow_pairs:
+        try:
+            ps_sym = _fix_sym_local(ps)
+            pp = mt5_direct_fn({"action": "price", "symbol": ps_sym})
+            pm1 = mt5_direct_fn({"action": "candles", "symbol": ps_sym, "timeframe": "M1", "count": 20})
+            pc = pm1.get("candles", pm1.get("data", []))
+            p_closes = [c["close"] for c in pc] if pc else [pp.get("bid", 0)]
+            p_change = (p_closes[-1] - p_closes[0]) / (p_closes[0] or 1) * 100 if len(p_closes) > 1 else 0
+            flow["pairs"][ps] = {
+                "bid": pp.get("bid", 0), "ask": pp.get("ask", 0),
+                "spread": pp.get("spread", 99),
+                "change_20pct": round(p_change, 3),
+                "direction": "up" if p_change > 0.02 else "down" if p_change < -0.02 else "flat",
+            }
+        except:
+            flow["pairs"][ps] = {"error": "failed"}
+    
+    # Detect money flow: which pairs are acting as leading indicators
+    # EURUSD vs USD strength
+    usd_strength = 0
+    count_strength = 0
+    for ps, pd in flow["pairs"].items():
+        if isinstance(pd, dict) and "direction" in pd:
+            if "USD" in ps:
+                if ps.startswith("USD") and pd["direction"] == "up":
+                    usd_strength -= 1  # USDJPY up = USD weak
+                elif ps.startswith("USD") and pd["direction"] == "down":
+                    usd_strength += 1  # USDJPY down = USD strong
+                elif ps.endswith("USD") and pd["direction"] == "up":
+                    usd_strength += 1  # EURUSD up = USD weak
+                elif ps.endswith("USD") and pd["direction"] == "down":
+                    usd_strength -= 1  # EURUSD down = USD strong
+                count_strength += 1
+    
+    flow["usd_index"] = {
+        "value": round(usd_strength / max(count_strength, 1) * 100, 1),
+        "bias": "USD_STRONG" if usd_strength > 2 else "USD_WEAK" if usd_strength < -2 else "USD_NEUTRAL",
+        "strength_count": usd_strength,
+    }
+    
+    # Correlation: what moves first (leading pair)
+    leaders = sorted(flow["pairs"].items(), key=lambda x: abs(x[1].get("change_20pct", 0)) if isinstance(x[1], dict) else 0, reverse=True)
+    flow["leading_mover"] = leaders[0][0] if leaders else None
+    
+    _BRAIN_CACHE["multi_pair"] = flow
+    result["multi_pair_flow"] = flow
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # LAYER 4: BROKER PREDATOR
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    profile = _BRAIN_CACHE.get("broker_profile", {})
+    if not profile:
+        profile = {"spread_timeline": [], "hunt_hours": {}, "avg_spread_by_hour": {}}
+    
+    hour_now = datetime.now(timezone.utc).hour
+    
+    # Record spread for this hour
+    if hour_now not in profile["avg_spread_by_hour"]:
+        profile["avg_spread_by_hour"][hour_now] = []
+    profile["avg_spread_by_hour"][hour_now].append(spread)
+    if len(profile["avg_spread_by_hour"][hour_now]) > 50:
+        profile["avg_spread_by_hour"][hour_now] = profile["avg_spread_by_hour"][hour_now][-50:]
+    
+    # Typical spread for this hour
+    typical_spreads = profile["avg_spread_by_hour"].get(hour_now, [spread])
+    typical_avg = sum(typical_spreads) / len(typical_spreads)
+    anomaly = spread > typical_avg * 1.5 if typical_avg > 0 else False
+    
+    # Detect hunt events (price spikes with spread widening)
+    hunt_events = 0
+    if len(m1) >= 10:
+        for i in range(1, 10):
+            prev_c = m1[-i-1] if i+1 < len(m1) else m1[-1]
+            curr_c = m1[-i] if i < len(m1) else m1[-1]
+            spike = abs(curr_c["high"] - curr_c["low"]) > abs(prev_c["close"] - prev_c["open"]) * 3
+            wide = curr_c.get("spread", spread) > typical_avg * 1.3
+            if spike and wide:
+                hunt_events += 1
+    
+    # Predict next broker manipulation
+    broker_prediction = "normal"
+    if anomaly:
+        broker_prediction = "spread_widening_imminent"
+    elif hunt_events >= 2:
+        broker_prediction = "stop_hunting_active"
+    elif spreads[-1] > sum(spreads[-10:]) / 10 * 1.2:
+        broker_prediction = "spread_normalizing"
+    
+    broker_warning = None
+    if anomaly and spread > 50:
+        broker_warning = "BROKER WARNING: Spread {spread} vs typical {int(typical_avg)} for this hour"
+    if hunt_events >= 3:
+        broker_warning = "BROKER ALERT: Stop hunting detected ({hunt_events} events in 10 candles)"
+    
+    broker_score = max(0, min(100, 100 - anomaly * 30 - hunt_events * 10 - (spread / max(typical_avg, 1) - 1) * 20))
+    
+    _BRAIN_CACHE["broker_profile"] = profile
+    
+    result["broker_intel"] = {
+        "current_spread": spread,
+        "typical_spread_hour": round(typical_avg, 1),
+        "anomaly": anomaly,
+        "hunt_events_10": hunt_events,
+        "prediction": broker_prediction,
+        "warning": broker_warning,
+        "trust_score": round(broker_score),
+    }
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # LAYER 5: NEXT 3 MOVES PREDICTION
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    moves = []
+    
+    # RSI
+    r15 = closes[-15:] if len(closes) >= 15 else closes
+    g = l = 0
+    for i in range(1, len(r15)):
+        d = r15[i] - r15[i-1]
+        g += max(d, 0)
+        l += max(-d, 0)
+    rsi = 50 if l == 0 else round(100 - 100 / (1 + g/l), 1)
+    
+    # EMA trend
+    fast = sum(closes[-5:]) / 5 if len(closes) >= 5 else bid
+    slow = sum(closes[-20:]) / 20 if len(closes) >= 20 else bid
+    trend_up = fast > slow
+    
+    # Support/Resistance
+    s1 = min(lows[-20:]) if len(lows) >= 20 else bid - pip*10
+    r1 = max(highs[-20:]) if len(highs) >= 20 else bid + pip*10
+    
+    # Next target broker
+    nt = liquidity.get("next_target", {})
+    nt_price = nt.get("price", bid)
+    nt_dir = nt.get("direction", "down")
+    
+    # Move 1: Broker hunt (market goes to liquidity then reverses)
+    move1_dir = nt_dir
+    move1_target = nt_price
+    
+    # Move 2: Smart money reaction (reversal from the hunt)
+    move2_dir = "up" if move1_dir == "down" else "down"
+    move2_target = round(bid + (bid - nt_price) * 0.5 if move1_dir == "down" else bid - (nt_price - bid) * 0.5, 5)
+    
+    # Move 3: True direction (where the real money is going)
+    inst_bias = inst.get("smart_money_bias", "neutral")
+    if inst_bias in ("accumulating", "buying"):
+        move3_dir = "up"
+        move3_target = round(r1 + pip * 5, 5)
+    elif inst_bias in ("distributing", "selling"):
+        move3_dir = "down"
+        move3_target = round(s1 - pip * 5, 5)
+    else:
+        move3_dir = move2_dir
+        move3_target = round(move2_target + (pip * 3 if move2_dir == "up" else -pip * 3), 5)
+    
+    # Confidence score
+    m1_conf = min(90, 50 + inst["confidence"] * 0.4 + broker_score * 0.2 - anomaly * 20)
+    
+    moves.append({
+        "move": 1, "direction": move1_dir, "target": round(move1_target, 5),
+        "type": "liquidity_hunt", "timeframe": "next_1-3min",
+        "confidence": min(round(m1_conf * 0.9), 85),
+    })
+    moves.append({
+        "move": 2, "direction": move2_dir, "target": round(move2_target, 5),
+        "type": "smart_money_reaction", "timeframe": "next_3-7min",
+        "confidence": min(round(m1_conf * 0.75), 75),
+    })
+    moves.append({
+        "move": 3, "direction": move3_dir, "target": round(move3_target, 5),
+        "type": "real_move", "timeframe": "next_7-15min",
+        "confidence": min(round(m1_conf * 0.6), 65),
+    })
+    
+    result["predicted_moves"] = moves
+    
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FINAL EDGE VERDICT
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    
+    edge_score = m1_conf
+    if inst_bias in ("accumulating", "buying") and move3_dir == "up":
+        edge_score += 10
+    elif inst_bias in ("distributing", "selling") and move3_dir == "down":
+        edge_score += 10
+    if anomaly:
+        edge_score -= 15
+    edge_score = max(0, min(99, edge_score))
+    
+    # Recommendation
+    if edge_score >= 70 and not anomaly:
+        if move3_dir == "up":
+            rec_action = "BUY"
+            rec_sl = round(move1_target - pip * 1.5, 5) if move1_dir == "down" else round(s1 - pip * 2, 5)
+            rec_tp = round(move3_target + pip * 2, 5)
+        else:
+            rec_action = "SELL"
+            rec_sl = round(move1_target + pip * 1.5, 5) if move1_dir == "up" else round(r1 + pip * 2, 5)
+            rec_tp = round(move3_target - pip * 2, 5)
+        rec = {"action": rec_action, "edge": edge_score,
+               "entry": round(bid if rec_action == "BUY" else ask, 5),
+               "sl": rec_sl, "tp": rec_tp, "confidence": "HIGH" if edge_score > 80 else "MEDIUM",
+               "reason": f"Smart money {inst_bias} | Next: {move1_dir.upper()}→{move2_dir.upper()}→{move3_dir.upper()}"}
+    elif edge_score >= 50:
+        rec = {"action": "WATCH", "edge": edge_score,
+               "reason": f"Waiting for better alignment. Edge {edge_score}% > need 70%",
+               "predicted_setup_in": move1_dir.upper() + " hunt at " + str(move1_target) + " then " + move2_dir.upper()}
+    else:
+        rec = {"action": "SKIP", "edge": edge_score,
+               "reason": f"Low edge ({edge_score}%). Anomaly={anomaly}, broker_trust={broker_score}"}
+    
+    result["market_brain"] = {
+        "edge_score": edge_score,
+        "institutional_bias": inst_bias,
+        "usd_bias": flow.get("usd_index", {}).get("bias", "unknown"),
+        "broker_prediction": broker_prediction,
+        "recommendation": rec,
+        "timeline": f"Move1: {move1_dir.upper()} to {round(move1_target,5)} | Move2: {move2_dir.upper()} to {round(move2_target,5)} | Move3: {move3_dir.upper()} to {round(move3_target,5)}",
+    }
+    
+    return result
+
+
+T("market_brain", lambda args: market_brain(
+    _mt5_direct, args.get("symbol","EURUSD")),
+  "Cerebro de Mercado: liquidez, huella institucional, flujo multi-par, broker predator, prediccion 3 movimientos. Ve lo que nadie ve.",
+  {"symbol":{"type":"string","default":"EURUSD"}})
+
+
 # ── Helper ──
 _FX_PAIRS_SET = {"EURUSD","GBPUSD","USDJPY","USDCAD","USDCHF","AUDUSD","NZDUSD",
                  "EURGBP","EURJPY","EURCHF","AUDJPY","GBPJPY","CHFJPY","EURAUD",
