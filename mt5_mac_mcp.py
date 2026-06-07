@@ -2258,6 +2258,132 @@ def _backtest_quick(candles, strategy="ma_cross"):
         "net_pnl": round(balance - 100, 2),
     }
 
+# ── Omnisight: Todo en Una Llamada ──
+
+def tool_omnisight(args: Dict[str, Any]) -> Dict[str, Any]:
+    """UNA llamada. TODO: live monitor + market brain + smart money + bg state + mejor entrada."""
+    symbol = args.get("symbol", "EURUSD")
+    include_ticks = args.get("include_ticks", True)
+    sym = _fix_sym(symbol)
+    result = {"symbol": symbol, "timestamp": datetime.now(timezone.utc).isoformat()}
+    
+    # 1. LIVE DATA (account, positions, orders, history, ticks)
+    try:
+        live = _mt5_direct({"action": "realtime_snapshot", "symbol": sym}, timeout=30.0)
+        result["live"] = {
+            "account": live.get("account", {}),
+            "positions": live.get("positions", {}),
+            "orders": live.get("orders", {}),
+            "history_1h": live.get("history_1h", {}),
+            "ticks_30s": live.get("ticks_30s", {}) if include_ticks else {"note": "omitted"},
+        }
+        # Current price
+        acct = live.get("account", {})
+        result["balance"] = acct.get("balance", 0)
+        result["equity"] = acct.get("equity", 0)
+        result["in_position"] = live.get("positions", {}).get("count", 0) > 0
+    except Exception as e:
+        result["live"] = {"error": str(e)}
+    
+    # 2. ALL PAIRS PRICES
+    pairs = {}
+    for ps in ["EURUSD","GBPUSD","USDJPY","USDCAD","AUDUSD","NZDUSD","USDCHF","EURGBP","EURJPY"]:
+        try:
+            p = _mt5_direct({"action": "price", "symbol": _fix_sym(ps)}, timeout=8.0)
+            pairs[ps] = {"bid": p.get("bid"), "ask": p.get("ask"), "spread": p.get("spread")}
+        except:
+            pairs[ps] = {"error": "failed"}
+    result["all_pairs"] = pairs
+    
+    # 3. MARKET BRAIN (liquidity, institutional, broker, predictions)
+    try:
+        from mt5_mcp_intelligence import market_brain
+        brain = market_brain(_mt5_direct, symbol)
+        if "market_brain" in brain:
+            mb = brain["market_brain"]
+            result["edge"] = mb.get("edge_score")
+            result["market_brain"] = {
+                "edge_score": mb.get("edge_score"),
+                "institutional_bias": mb.get("institutional_bias"),
+                "usd_bias": mb.get("usd_bias"),
+                "broker_prediction": mb.get("broker_prediction"),
+                "recommendation": mb.get("recommendation"),
+                "timeline": mb.get("timeline"),
+            }
+        if "predicted_moves" in brain:
+            result["predicted_moves"] = brain["predicted_moves"]
+        if "liquidity_map" in brain:
+            result["liquidity_map"] = brain["liquidity_map"]
+        if "institutional_footprint" in brain:
+            result["institutional_footprint"] = {
+                "smart_money_bias": brain["institutional_footprint"].get("smart_money_bias"),
+                "absorption_ratio": brain["institutional_footprint"].get("absorption_ratio"),
+                "confidence": brain["institutional_footprint"].get("confidence"),
+                "buy_vol_50": brain["institutional_footprint"].get("buy_vol_50"),
+                "sell_vol_50": brain["institutional_footprint"].get("sell_vol_50"),
+            }
+        if "broker_intel" in brain:
+            result["broker_intel"] = brain["broker_intel"]
+        if "multi_pair_flow" in brain:
+            result["multi_pair_flow"] = {
+                "usd_index": brain["multi_pair_flow"].get("usd_index"),
+                "leading_mover": brain["multi_pair_flow"].get("leading_mover"),
+            }
+    except Exception as e:
+        result["market_brain"] = {"error": str(e)}
+    
+    # 4. SMART MONEY MAP (manipulation, stops)
+    try:
+        from mt5_mcp_intelligence import smart_money_map
+        smm = smart_money_map(_mt5_direct, symbol)
+        if "broker" in smm:
+            result["broker_trust"] = smm["broker"].get("trust_score")
+            result["broker_assessment"] = smm["broker"].get("assessment")
+        if "retail_stops" in smm:
+            result["retail_stops"] = {
+                "above": smm["retail_stops"].get("stops_above_pips"),
+                "below": smm["retail_stops"].get("stops_below_pips"),
+                "safest_sl_long": smm["retail_stops"].get("safest_sl_long"),
+                "safest_sl_short": smm["retail_stops"].get("safest_sl_short"),
+            }
+    except Exception as e:
+        result["smart_money_map"] = {"error": str(e)}
+    
+    # 5. BG DAEMON STATE (latest pre-computed context)
+    bg_file = Path(__file__).parent / "data" / "bg_state.json"
+    if bg_file.exists():
+        try:
+            bg = json.loads(bg_file.read_text())
+            result["bg_context"] = {
+                "session": bg.get("session"),
+                "session_quality": bg.get("session_quality"),
+                "market_volatility": bg.get("market_volatility"),
+                "best_pairs": bg.get("best_pairs", [])[:3],
+            }
+        except:
+            pass
+    
+    # 6. FINAL VERDICT — mejor accion AHORA
+    rec = result.get("market_brain", {}).get("recommendation", {})
+    broker_ok = result.get("broker_trust", 0) or 0 > 40
+    edge = result.get("edge", 0) or 0
+    
+    if rec and rec.get("action") in ("BUY", "SELL") and edge >= 60 and broker_ok:
+        result["verdict"] = f"✅ {rec['action']} {symbol} | Edge {edge}% | SL: {rec.get('sl','?')} | TP: {rec.get('tp','?')} | {rec.get('reason','')}"
+        result["action"] = rec["action"]
+        result["entry"] = rec.get("entry")
+        result["sl"] = rec.get("sl")
+        result["tp"] = rec.get("tp")
+    elif rec and rec.get("action") in ("BUY", "SELL"):
+        result["verdict"] = f"⚠️ {rec['action']} {symbol} | Edge solo {edge}% | Esperar mejor confirmacion"
+        result["action"] = "WATCH"
+    else:
+        result["verdict"] = f"⏸️ SKIP {symbol} | Edge {edge}% | Broker trust {result.get('broker_trust', '?')} | {rec.get('reason','')}" if rec else f"⏸️ SKIP — sin senal clara"
+        result["action"] = "SKIP"
+    
+    return result
+
+
 # ── Live Market Monitor ──
 
 def tool_live_monitor(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2658,6 +2784,10 @@ TOOLS: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], str, Dict[str
         "count": {"type": "integer", "default": 50},
     })),
     "mt5_live_prices": (tool_live_prices, "Precios en vivo de TODOS los pares mayores en una sola llamada.", schema({})),
+    "mt5_omnisight": (tool_omnisight, "TODO en 1 llamada: live monitor + market brain + smart money + bg state + top entry. Ve el mercado completo, anticipa movimientos, ejecuta al instante.", schema({
+        "symbol": {"type": "string", "default": "EURUSD"},
+        "include_ticks": {"type": "boolean", "default": True},
+    })),
 }
 
 # Merge intelligence tools
