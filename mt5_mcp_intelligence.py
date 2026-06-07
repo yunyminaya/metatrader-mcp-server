@@ -969,6 +969,599 @@ T("market_fair_value_gaps", lambda args: fair_value_gaps(_mt5_direct, args.get("
 T("market_trend_structure", lambda args: trend_structure(_mt5_direct, args.get("symbol", "EURUSD")),
   "Multi-timeframe trend: D1 → H4 → H1 alignment. Only trade when aligned.", {"symbol": {"type": "string", "default": "EURUSD"}})
 
+# ── Backtesting Engine ──
+
+def backtest(mt5_direct_fn, symbol="EURUSD", timeframe="H1", strategy="ma_cross",
+             start_idx=0, end_idx=0, fast_ma=5, slow_ma=20, rsi_period=14,
+             rsi_overbought=70, rsi_oversold=30, sl_atr=1.5, tp_atr=3.0):
+    """Simple backtesting engine. Simulates a strategy on historical data."""
+    count = 200 if end_idx <= 0 else end_idx - start_idx
+    raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": timeframe, "count": count + 100})
+    candles = raw.get("candles", raw.get("data", []))
+    if not candles or len(candles) < slow_ma + 10:
+        return {"error": "insufficient data", "candles": len(candles)}
+    
+    if end_idx > 0 and end_idx <= len(candles):
+        candles = candles[start_idx:end_idx]
+    elif start_idx > 0:
+        candles = candles[start_idx:]
+    
+    trades = []
+    balance = 1000.0
+    position = None
+    closes = [c["close"] for c in candles]
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    times = [c.get("time", i) for i, c in enumerate(candles)]
+    
+    # Precompute indicators
+    def ema(data, period):
+        if len(data) < period:
+            return [None] * len(data)
+        result = []
+        mult = 2 / (period + 1)
+        ema_val = sum(data[:period]) / period
+        for i, val in enumerate(data):
+            if i < period - 1:
+                result.append(None)
+            elif i == period - 1:
+                result.append(ema_val)
+            else:
+                ema_val = (val - ema_val) * mult + ema_val
+                result.append(ema_val)
+        return result
+    
+    def rsi_vals(data, period):
+        if len(data) < period + 1:
+            return [None] * len(data)
+        result = [None] * period
+        gains, losses = 0, 0
+        for i in range(1, period + 1):
+            diff = data[i] - data[i-1]
+            gains += max(diff, 0)
+            losses += max(-diff, 0)
+        avg_gain = gains / period
+        avg_loss = losses / period
+        for i in range(period, len(data)):
+            diff = data[i] - data[i-1]
+            avg_gain = (avg_gain * (period - 1) + max(diff, 0)) / period
+            avg_loss = (avg_loss * (period - 1) + max(-diff, 0)) / period
+            rs = avg_gain / avg_loss if avg_loss > 0 else 100
+            result.append(100 - 100 / (1 + rs))
+        return result
+    
+    # ATR
+    def atr_vals(candles, period=14):
+        if len(candles) < period + 1:
+            return [None] * len(candles)
+        trs = []
+        for i in range(1, len(candles)):
+            hl = candles[i]["high"] - candles[i]["low"]
+            hc = abs(candles[i]["high"] - candles[i-1]["close"])
+            lc = abs(candles[i]["low"] - candles[i-1]["close"])
+            trs.append(max(hl, hc, lc))
+        result = [None] * (period)
+        atr_val = sum(trs[:period]) / period
+        for i in range(period, len(trs)):
+            result.append(atr_val)
+            atr_val = (atr_val * (period - 1) + trs[i]) / period
+        result.append(atr_val)
+        while len(result) < len(candles):
+            result.append(atr_val)
+        return result[-len(candles):] if len(result) >= len(candles) else [None]*len(candles)
+    
+    fast_ema = ema(closes, fast_ma)
+    slow_ema = ema(closes, slow_ma)
+    rsi_arr = rsi_vals(closes, rsi_period)
+    atr_arr = atr_vals(candles, 14)
+    
+    for i in range(max(slow_ma, rsi_period, 14), len(candles)):
+        if strategy == "ma_cross":
+            if fast_ema[i] is not None and slow_ema[i] is not None:
+                prev_fast = fast_ema[i-1] if i > 0 else fast_ema[i]
+                prev_slow = slow_ema[i-1] if i > 0 else slow_ema[i]
+                is_buy = prev_fast <= prev_slow and fast_ema[i] > slow_ema[i]
+                is_sell = prev_fast >= prev_slow and fast_ema[i] < slow_ema[i]
+                if is_buy:
+                    position = {"type": "BUY", "entry": closes[i], "index": i, "time": times[i]}
+                elif is_sell:
+                    position = {"type": "SELL", "entry": closes[i], "index": i, "time": times[i]}
+        
+        elif strategy == "rsi_mean_reversion":
+            if rsi_arr[i] is not None:
+                if rsi_arr[i] < rsi_oversold and position is None:
+                    position = {"type": "BUY", "entry": closes[i], "index": i, "time": times[i]}
+                elif rsi_arr[i] > rsi_overbought and position is None:
+                    position = {"type": "SELL", "entry": closes[i], "index": i, "time": times[i]}
+        
+        elif strategy == "trend_follow":
+            if fast_ema[i] is not None and rsi_arr[i] is not None:
+                if fast_ema[i] > closes[i] and rsi_arr[i] < 50 and position is None:
+                    position = {"type": "BUY", "entry": closes[i], "index": i, "time": times[i]}
+                elif fast_ema[i] < closes[i] and rsi_arr[i] > 50 and position is None:
+                    position = {"type": "SELL", "entry": closes[i], "index": i, "time": times[i]}
+        
+        if position is not None:
+            atr_val = atr_arr[i] if atr_arr[i] is not None else 0.001
+            sl_dist = atr_val * sl_atr
+            tp_dist = atr_val * tp_atr
+            entry = position["entry"]
+            exit_price = None
+            exit_reason = None
+            
+            for j in range(i + 1, min(i + 100, len(candles))):
+                if position["type"] == "BUY":
+                    if lows[j] <= entry - sl_dist:
+                        exit_price = entry - sl_dist
+                        exit_reason = "stop_loss"
+                        break
+                    if highs[j] >= entry + tp_dist:
+                        exit_price = entry + tp_dist
+                        exit_reason = "take_profit"
+                        break
+                else:
+                    if highs[j] >= entry + sl_dist:
+                        exit_price = entry + sl_dist
+                        exit_reason = "stop_loss"
+                        break
+                    if lows[j] <= entry - tp_dist:
+                        exit_price = entry - tp_dist
+                        exit_reason = "take_profit"
+                        break
+            
+            if exit_price is None and i + 100 < len(candles):
+                exit_price = closes[min(i + 100, len(candles) - 1)]
+                exit_reason = "time_exit"
+            
+            if exit_price is not None:
+                pnl_pct = (exit_price - entry) / entry if position["type"] == "BUY" else (entry - exit_price) / entry
+                pnl = balance * pnl_pct * 10  # assume 10x leverage for directional bet
+                balance += pnl
+                trades.append({
+                    "entry_time": position.get("time", i),
+                    "exit_time": times[min(j, len(candles)-1)] if exit_price else times[-1],
+                    "type": position["type"],
+                    "entry": round(entry, 5),
+                    "exit": round(exit_price, 5),
+                    "pnl": round(pnl, 2),
+                    "pnl_pct": round(pnl_pct * 100, 2),
+                    "reason": exit_reason,
+                    "rsi_entry": round(rsi_arr[i], 1) if rsi_arr[i] is not None else 0,
+                    "atr_entry": round(atr_val, 5),
+                })
+                position = None
+    
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    total_pnl = sum(t["pnl"] for t in trades)
+    win_rate = len(wins) / len(trades) if trades else 0
+    avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
+    avg_loss = abs(sum(t["pnl"] for t in losses) / len(losses)) if losses else 0
+    profit_factor = sum(t["pnl"] for t in wins) / abs(sum(t["pnl"] for t in losses)) if losses and sum(t["pnl"] for t in losses) != 0 else float('inf') if wins else 0
+    
+    # Sharpe ratio (simplified)
+    returns = [t["pnl_pct"] for t in trades]
+    avg_return = sum(returns) / len(returns) if returns else 0
+    std_return = (sum((r - avg_return)**2 for r in returns) / len(returns))**0.5 if len(returns) > 1 else 1
+    sharpe = avg_return / std_return * (252**0.5) if std_return > 0 else 0
+    
+    # Max drawdown
+    peak = 1000
+    dd = 0
+    for t in trades:
+        peak = max(peak, 1000 + t["pnl"])
+        dd = max(dd, peak - (1000 + sum(t2["pnl"] for t2 in trades[:trades.index(t)+1])))
+    max_dd_pct = dd / peak * 100 if peak > 0 else 0
+    
+    return {
+        "symbol": symbol, "timeframe": timeframe, "strategy": strategy,
+        "total_trades": len(trades), "wins": len(wins), "losses": len(losses),
+        "win_rate_pct": round(win_rate * 100, 1),
+        "total_pnl": round(total_pnl, 2),
+        "final_balance": round(balance, 2),
+        "profit_factor": round(profit_factor, 2) if profit_factor != float('inf') else "inf",
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "sharpe": round(sharpe, 2),
+        "max_drawdown_pct": round(max_dd_pct, 1),
+        "best_trade": max(trades, key=lambda x: x["pnl"])["pnl"] if trades else 0,
+        "worst_trade": min(trades, key=lambda x: x["pnl"])["pnl"] if trades else 0,
+        "expectancy": round(total_pnl / len(trades), 2) if trades else 0,
+    }
+
+
+# ── Multi-Timeframe Combo Analysis ──
+
+def multi_timeframe_combo(mt5_direct_fn, symbol="EURUSD", timeframes=None):
+    """Evaluate conviction across M5, M15, H1, H4, D1. Returns alignment score 0-100."""
+    if timeframes is None:
+        timeframes = ["M5", "M15", "H1", "H4", "D1"]
+    results = {}
+    weights = {"M5": 0.10, "M15": 0.15, "H1": 0.25, "H4": 0.25, "D1": 0.25}
+    
+    for tf in timeframes:
+        try:
+            raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": tf, "count": 100})
+            candles = raw.get("candles", raw.get("data", []))
+            if not candles or len(candles) < 20:
+                results[tf] = {"verdict": "unknown", "confidence": 0}
+                continue
+            closes = [c["close"] for c in candles]
+            highs = [c["high"] for c in candles]
+            lows = [c["low"] for c in candles]
+            
+            # RSI
+            gains, losses = 0, 0
+            for i in range(1, 15):
+                diff = closes[-i] - closes[-i-1]
+                gains += max(diff, 0)
+                losses += max(-diff, 0)
+            rsi = 50
+            if losses > 0:
+                rs = gains / losses
+                rsi = 100 - 100 / (1 + rs)
+            
+            # EMA trend
+            fast = sum(closes[-5:]) / 5
+            slow = sum(closes[-10:]) / 10
+            ema_trend = "up" if fast > slow else "down"
+            
+            # Higher highs/lows
+            hh = highs[-1] > highs[-3] and highs[-3] > highs[-5]
+            hl = lows[-1] > lows[-3] and lows[-3] > lows[-5]
+            lh = highs[-1] < highs[-3] and highs[-3] < highs[-5]
+            ll = lows[-1] < lows[-3] and lows[-3] < lows[-5]
+            
+            if hh and hl and ema_trend == "up":
+                verdict, conf = "BUY", min(90, 50 + rsi)
+            elif lh and ll and ema_trend == "down":
+                verdict, conf = "SELL", min(90, 50 + (100 - rsi))
+            elif ema_trend == "up" and rsi > 50:
+                verdict, conf = "BUY", min(70, rsi)
+            elif ema_trend == "down" and rsi < 50:
+                verdict, conf = "SELL", min(70, 100 - rsi)
+            else:
+                verdict, conf = "PASS", 0
+            
+            results[tf] = {
+                "verdict": verdict, "confidence": conf,
+                "rsi": round(rsi, 1), "trend": ema_trend,
+            }
+        except Exception as e:
+            results[tf] = {"verdict": "error", "confidence": 0, "error": str(e)}
+    
+    # Weighted vote
+    buy_conf = sum(weights.get(tf, 0) * r.get("confidence", 0) 
+                   for tf, r in results.items() if r.get("verdict") == "BUY")
+    sell_conf = sum(weights.get(tf, 0) * r.get("confidence", 0)
+                    for tf, r in results.items() if r.get("verdict") == "SELL")
+    
+    total_weight = sum(weights.get(tf, 0) for tf in timeframes if tf in results)
+    if total_weight > 0:
+        buy_conf /= total_weight
+        sell_conf /= total_weight
+    
+    if buy_conf > sell_conf and buy_conf > 30:
+        final = "BUY"
+        alignment = round(buy_conf)
+    elif sell_conf > buy_conf and sell_conf > 30:
+        final = "SELL"
+        alignment = round(sell_conf)
+    else:
+        final = "PASS"
+        alignment = 0
+    
+    aligned_tfs = sum(1 for r in results.values() if r.get("verdict") == final)
+    
+    return {
+        "symbol": symbol, "final_verdict": final, "alignment_pct": alignment,
+        "aligned_timeframes": f"{aligned_tfs}/{len(timeframes)}",
+        "buy_confidence": round(buy_conf, 1), "sell_confidence": round(sell_conf, 1),
+        "timeframe_analysis": results,
+    }
+
+
+# ── ML Predictor (pattern-based) ──
+
+ML_DATA_FILE = os.path.join(DATA_DIR, "ml_patterns.json")
+
+def _load_ml_data():
+    if not os.path.exists(ML_DATA_FILE):
+        return {"patterns": [], "version": 1}
+    try:
+        return json.load(open(ML_DATA_FILE))
+    except:
+        return {"patterns": [], "version": 1}
+
+def _save_ml_data(data):
+    os.makedirs(os.path.dirname(ML_DATA_FILE), exist_ok=True)
+    with open(ML_DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def ml_train(mt5_direct_fn, symbol="EURUSD", timeframe="H1", lookback=500, min_patterns=20):
+    """Extract patterns from historical data and train the ML model.
+    Pattern = last N candle bodies + direction of next candle."""
+    raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": timeframe, "count": lookback})
+    candles = raw.get("candles", raw.get("data", []))
+    if not candles or len(candles) < 30:
+        return {"error": "insufficient data", "trained": False}
+    
+    data = _load_ml_data()
+    new_count = 0
+    pattern_len = 5
+    
+    for i in range(pattern_len, len(candles) - 1):
+        pattern = []
+        for j in range(pattern_len):
+            c = candles[i - pattern_len + j]
+            body = abs(c["close"] - c["open"])
+            total_range = c["high"] - c["low"]
+            body_pct = round(body / total_range * 100, 1) if total_range > 0 else 0
+            direction = 1 if c["close"] > c["open"] else 0
+            pattern.append({"body_pct": body_pct, "direction": direction,
+                            "volume_ratio": round(c.get("tick_volume", c.get("volume", 0)) / 1000, 1)})
+        
+        next_dir = 1 if candles[i+1]["close"] > candles[i+1]["open"] else 0
+        next_move_pct = round((candles[i+1]["close"] - candles[i+1]["open"]) / candles[i+1]["open"] * 100, 3)
+        
+        data["patterns"].append({
+            "symbol": symbol, "timeframe": timeframe,
+            "pattern": pattern, "next_direction": next_dir,
+            "next_move_pct": next_move_pct,
+            "timestamp": candles[i].get("time", ""),
+        })
+        new_count += 1
+    
+    # Keep only last 2000 per symbol/timeframe
+    key = f"{symbol}_{timeframe}"
+    all_p = [p for p in data["patterns"] if p.get("symbol") == symbol and p.get("timeframe") == timeframe]
+    if len(all_p) > 2000:
+        excess = len(all_p) - 2000
+        data["patterns"] = [p for p in data["patterns"] if not (p.get("symbol") == symbol and p.get("timeframe") == timeframe)] + all_p[excess:]
+    
+    _save_ml_data(data)
+    
+    key_patterns = [p for p in data["patterns"] if p.get("symbol") == symbol and p.get("timeframe") == timeframe]
+    return {
+        "trained": True,
+        "symbol": symbol, "timeframe": timeframe,
+        "new_patterns": new_count,
+        "total_patterns": len(key_patterns),
+        "total_db": len(data["patterns"]),
+    }
+
+
+def ml_predict(mt5_direct_fn, symbol="EURUSD", timeframe="H1"):
+    """Predict next candle direction using pattern matching against historical data."""
+    # Get current pattern
+    raw = mt5_direct_fn({"action": "candles", "symbol": symbol, "timeframe": timeframe, "count": 10})
+    candles = raw.get("candles", raw.get("data", []))
+    if not candles or len(candles) < 6:
+        return {"error": "insufficient current data"}
+    
+    current = []
+    pattern_len = 5
+    for j in range(pattern_len):
+        c = candles[-pattern_len + j]
+        body = abs(c["close"] - c["open"])
+        total_range = c["high"] - c["low"]
+        body_pct = round(body / total_range * 100, 1) if total_range > 0 else 0
+        direction = 1 if c["close"] > c["open"] else 0
+        current.append({"body_pct": body_pct, "direction": direction})
+    
+    # Load historical data
+    data = _load_ml_data()
+    patterns = [p for p in data["patterns"] if p.get("symbol") == symbol and p.get("timeframe") == timeframe]
+    
+    if len(patterns) < 5:
+        return {
+            "symbol": symbol, "timeframe": timeframe,
+            "prediction": "insufficient_data",
+            "confidence": 0,
+            "patterns_available": len(patterns),
+            "note": "Train with ml_train first. Need at least 5 patterns.",
+        }
+    
+    # Match: find most similar patterns using simple euclidean distance
+    scored = []
+    for p in patterns[-500:]:  # limit to last 500 for speed
+        hist_pat = p["pattern"]
+        if len(hist_pat) != len(current):
+            continue
+        distance = 0
+        for a, b in zip(current, hist_pat):
+            distance += (a["body_pct"] - b["body_pct"])**2 + (a["direction"] - b["direction"])**2 * 100
+        scored.append((distance, p["next_direction"], p.get("next_move_pct", 0)))
+    
+    if not scored:
+        return {"prediction": "no_match", "confidence": 0}
+    
+    scored.sort(key=lambda x: x[0])
+    top_n = min(20, len(scored))
+    top_matches = scored[:top_n]
+    
+    buys = sum(1 for _, d, _ in top_matches if d == 1)
+    sells = top_n - buys
+    buy_pct = buys / top_n * 100
+    avg_move = sum(abs(pct) for _, _, pct in top_matches) / top_n
+    
+    if buy_pct > 60:
+        prediction = "BUY"
+        confidence = round(buy_pct)
+    elif buy_pct < 40:
+        prediction = "SELL"
+        confidence = round(100 - buy_pct)
+    else:
+        prediction = "PASS"
+        confidence = round(abs(buy_pct - 50) * 2)  # how far from 50/50
+    
+    similarity = round(1 / (1 + scored[0][0]) * 100, 1) if scored[0][0] > 0 else 99
+    
+    return {
+        "symbol": symbol, "timeframe": timeframe,
+        "prediction": prediction,
+        "confidence": min(confidence, 99),
+        "patterns_matched": top_n,
+        "avg_move_pct": round(avg_move, 3),
+        "bullish_ratio": round(buy_pct, 1),
+        "similarity_pct": similarity,
+        "total_patterns_db": len(patterns),
+    }
+
+
+# ── Helper ──
+_FX_PAIRS_SET = {"EURUSD","GBPUSD","USDJPY","USDCAD","USDCHF","AUDUSD","NZDUSD",
+                 "EURGBP","EURJPY","EURCHF","AUDJPY","GBPJPY","CHFJPY","EURAUD",
+                 "EURCAD","GBPCHF","GBPAUD","AUDCAD","AUDCHF","AUDNZD","CADCHF",
+                 "CADJPY","NZDCAD","NZDJPY","NZDCHF","GBPNZD","EURNZD"}
+def _fix_sym_local(sym):
+    return sym + ".FX" if sym in _FX_PAIRS_SET else sym
+
+# ── Enhanced Auto-Journaling ──
+
+JOURNAL_FILE = os.path.join(DATA_DIR, "auto_journal.json")
+
+def _load_journal():
+    if not os.path.exists(JOURNAL_FILE):
+        return {"trades": [], "version": 2}
+    try:
+        return json.load(open(JOURNAL_FILE))
+    except:
+        return {"trades": [], "version": 2}
+
+def _save_journal(data):
+    os.makedirs(os.path.dirname(JOURNAL_FILE), exist_ok=True)
+    with open(JOURNAL_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def journal_auto_record(mt5_direct_fn, trade_result):
+    """Auto-record trade with full context. Call after every closed trade.
+    trade_result must have: symbol, type, entry, exit, pnl, volume, strategy."""
+    journal = _load_journal()
+    
+    # Enrich with market context
+    symbol = trade_result.get("symbol", "")
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "symbol": symbol,
+        "type": trade_result.get("type"),
+        "entry": trade_result.get("entry"),
+        "exit": trade_result.get("exit"),
+        "pnl": trade_result.get("pnl"),
+        "volume": trade_result.get("volume", 0.01),
+        "strategy": trade_result.get("strategy", "manual"),
+        "reason": trade_result.get("reason", ""),
+        "tags": trade_result.get("tags", []),
+    }
+    
+    # Add market context
+    try:
+        raw = mt5_direct_fn({"action": "price", "symbol": _fix_sym(symbol)})
+        entry["spread_at_exit"] = raw.get("spread", 0)
+    except:
+        pass
+    try:
+        raw = mt5_direct_fn({"action": "candles", "symbol": _fix_sym_local(symbol), "timeframe": "H1", "count": 30})
+        candles = raw.get("candles", raw.get("data", []))
+        if candles and len(candles) > 14:
+            closes = [c["close"] for c in candles[-15:]]
+            gains, losses = 0, 0
+            for i in range(1, len(closes)):
+                diff = closes[i] - closes[i-1]
+                gains += max(diff, 0)
+                losses += max(-diff, 0)
+            if losses > 0:
+                entry["rsi_exit"] = round(100 - 100 / (1 + gains/losses), 1)
+            entry["regime"] = "unknown"
+    except:
+        pass
+    try:
+        from datetime import datetime as dt
+        hour = dt.now(timezone.utc).hour
+        if 8 <= hour < 17:
+            entry["session"] = "London"
+        elif 13 <= hour < 22:
+            entry["session"] = "NY"
+        elif 0 <= hour < 9:
+            entry["session"] = "Asia/Pacific"
+        else:
+            entry["session"] = "off_hours"
+    except:
+        entry["session"] = "unknown"
+    
+    journal["trades"].append(entry)
+    _save_journal(journal)
+    
+    return {"recorded": True, "trade_id": len(journal["trades"]), "entry": entry}
+
+
+def journal_query(query_type="all", limit=20):
+    """Query the auto-journal. Types: all, wins, losses, by_symbol, by_strategy."""
+    journal = _load_journal()
+    trades = journal.get("trades", [])
+    
+    if query_type == "wins":
+        trades = [t for t in trades if t.get("pnl", 0) > 0]
+    elif query_type == "losses":
+        trades = [t for t in trades if t.get("pnl", 0) <= 0]
+    
+    trades = trades[-limit:] if len(trades) > limit else trades
+    
+    wins = len([t for t in journal.get("trades", []) if t.get("pnl", 0) > 0])
+    losses = len([t for t in journal.get("trades", []) if t.get("pnl", 0) <= 0])
+    total_pnl = sum(t.get("pnl", 0) for t in journal.get("trades", []))
+    
+    return {
+        "total_trades": len(journal.get("trades", [])),
+        "total_pnl": round(total_pnl, 2),
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0,
+        "recent_trades": trades,
+    }
+
+
+T("backtest_strategy", lambda args: backtest(
+    _mt5_direct, args.get("symbol","EURUSD"), args.get("timeframe","H1"), args.get("strategy","ma_cross"),
+    int(args.get("start_idx",0)), int(args.get("end_idx",0)),
+    int(args.get("fast_ma",5)), int(args.get("slow_ma",20)),
+    int(args.get("rsi_period",14)), int(args.get("rsi_overbought",70)), int(args.get("rsi_oversold",30)),
+    float(args.get("sl_atr",1.5)), float(args.get("tp_atr",3.0))),
+  "Backtest a strategy on historical data. Returns win rate, profit factor, Sharpe, drawdown.",
+  {"symbol":{"type":"string","default":"EURUSD"},"timeframe":{"type":"string","default":"H1"},
+   "strategy":{"type":"string","enum":["ma_cross","rsi_mean_reversion","trend_follow"],"default":"ma_cross"},
+   "fast_ma":{"type":"integer","default":5},"slow_ma":{"type":"integer","default":20},
+   "sl_atr":{"type":"number","default":1.5},"tp_atr":{"type":"number","default":3.0}})
+
+T("multi_timeframe_analysis", lambda args: multi_timeframe_combo(
+    _mt5_direct, args.get("symbol","EURUSD"), args.get("timeframes",None)),
+  "Evaluate conviction across M5/M15/H1/H4/D1. Weighted vote with alignment score 0-100.",
+  {"symbol":{"type":"string","default":"EURUSD"},"timeframes":{"type":"array","items":{"type":"string"},"default":[]}})
+
+T("ml_train", lambda args: ml_train(
+    _mt5_direct, args.get("symbol","EURUSD"), args.get("timeframe","H1"),
+    int(args.get("lookback",500))),
+  "Train ML predictor: extract candle patterns from historical data.",
+  {"symbol":{"type":"string","default":"EURUSD"},"timeframe":{"type":"string","default":"H1"},"lookback":{"type":"integer","default":500}})
+
+T("ml_predict", lambda args: ml_predict(
+    _mt5_direct, args.get("symbol","EURUSD"), args.get("timeframe","H1")),
+  "Predict next candle using pattern matching against trained historical data.",
+  {"symbol":{"type":"string","default":"EURUSD"},"timeframe":{"type":"string","default":"H1"}})
+
+T("journal_auto_record", lambda args: journal_auto_record(
+    _mt5_direct, args),
+  "Auto-record trade with full market context. Call after every closed trade.",
+  {"symbol":{"type":"string"},"type":{"type":"string"},"entry":{"type":"number"},"exit":{"type":"number"},
+   "pnl":{"type":"number"},"volume":{"type":"number","default":0.01},"strategy":{"type":"string","default":"manual"}},
+  ["symbol","type","entry","exit","pnl"])
+
+T("journal_query", lambda args: journal_query(
+    args.get("query","all"), int(args.get("limit",20))),
+  "Query auto-journal: wins, losses, by symbol, by strategy.",
+  {"query":{"type":"string","enum":["all","wins","losses"],"default":"all"},"limit":{"type":"integer","default":20}})
+
+
 # Need _mt5_direct reference from the main server
 _mt5_direct = None
 

@@ -1636,6 +1636,288 @@ def tool_pretrade_check(args: Dict[str, Any]) -> Dict[str, Any]:
     return results
 
 
+# ── Paper Trading Engine ──
+
+PAPER_FILE = DATA_DIR / "paper_trading.json"
+
+def _load_paper():
+    if not PAPER_FILE.exists():
+        return {"balance": 1000.0, "initial_balance": 1000.0, "positions": [], "closed": [], "version": 1}
+    try:
+        return json.loads(PAPER_FILE.read_text())
+    except:
+        return {"balance": 1000.0, "initial_balance": 1000.0, "positions": [], "closed": [], "version": 1}
+
+def _save_paper(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PAPER_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+def tool_paper_init(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Initialize or reset paper trading with a virtual balance."""
+    balance = float(args.get("balance", 1000.0))
+    state = {"balance": balance, "initial_balance": balance, "positions": [], "closed": [], "version": 1}
+    _save_paper(state)
+    return {"status": "ok", "balance": balance, "initial_balance": balance}
+
+def tool_paper_buy(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Paper buy. Simulates a BUY trade with virtual money."""
+    symbol = args.get("symbol", "EURUSD")
+    sym = _fix_sym(symbol)
+    volume = float(args.get("volume", 0.01))
+    
+    price_data = _mt5_direct({"action": "price", "symbol": sym})
+    ask = price_data.get("ask", 0)
+    spread = price_data.get("spread", 0)
+    if ask <= 0:
+        return {"error": "no price available"}
+    
+    state = _load_paper()
+    cost = ask * volume * 100000
+    margin_needed = cost / 200  # 1:200 leverage
+    
+    if margin_needed > state["balance"]:
+        return {"error": f"insufficient paper balance: need ${margin_needed:.2f}, have ${state['balance']:.2f}"}
+    
+    sl = float(args.get("stop_loss", 0))
+    tp = float(args.get("take_profit", 0))
+    
+    position = {
+        "ticket": len(state["positions"]) + len(state["closed"]) + 1,
+        "symbol": symbol,
+        "type": "BUY",
+        "volume": volume,
+        "entry": ask,
+        "sl": sl,
+        "tp": tp,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "margin": margin_needed,
+    }
+    
+    state["balance"] -= margin_needed
+    state["positions"].append(position)
+    _save_paper(state)
+    
+    return {"status": "open", "position": position, "paper_balance": round(state["balance"], 2)}
+
+def tool_paper_sell(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Paper sell. Simulates a SELL trade with virtual money."""
+    symbol = args.get("symbol", "EURUSD")
+    sym = _fix_sym(symbol)
+    volume = float(args.get("volume", 0.01))
+    
+    price_data = _mt5_direct({"action": "price", "symbol": sym})
+    bid = price_data.get("bid", 0)
+    spread = price_data.get("spread", 0)
+    if bid <= 0:
+        return {"error": "no price available"}
+    
+    state = _load_paper()
+    cost = bid * volume * 100000
+    margin_needed = cost / 200
+    
+    if margin_needed > state["balance"]:
+        return {"error": f"insufficient paper balance: need ${margin_needed:.2f}, have ${state['balance']:.2f}"}
+    
+    sl = float(args.get("stop_loss", 0))
+    tp = float(args.get("take_profit", 0))
+    
+    position = {
+        "ticket": len(state["positions"]) + len(state["closed"]) + 1,
+        "symbol": symbol,
+        "type": "SELL",
+        "volume": volume,
+        "entry": bid,
+        "sl": sl,
+        "tp": tp,
+        "time": datetime.now(timezone.utc).isoformat(),
+        "margin": margin_needed,
+    }
+    
+    state["balance"] -= margin_needed
+    state["positions"].append(position)
+    _save_paper(state)
+    
+    return {"status": "open", "position": position, "paper_balance": round(state["balance"], 2)}
+
+def tool_paper_close(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Close a paper position by ticket."""
+    ticket = int(args.get("ticket", 0))
+    state = _load_paper()
+    
+    pos = None
+    for i, p in enumerate(state["positions"]):
+        if p.get("ticket") == ticket:
+            pos = state["positions"].pop(i)
+            break
+    
+    if not pos:
+        return {"error": f"position {ticket} not found"}
+    
+    sym = _fix_sym(pos["symbol"])
+    price_data = _mt5_direct({"action": "price", "symbol": sym})
+    
+    if pos["type"] == "BUY":
+        exit_price = price_data.get("bid", 0)
+        pnl = (exit_price - pos["entry"]) * pos["volume"] * 100000
+    else:
+        exit_price = price_data.get("ask", 0)
+        pnl = (pos["entry"] - exit_price) * pos["volume"] * 100000
+    
+    spread_cost = (price_data.get("spread", 0) * 0.00001) * pos["volume"] * 100000
+    pnl -= spread_cost
+    
+    state["balance"] += pos["margin"] + pnl
+    
+    closed = dict(pos)
+    closed["exit"] = exit_price
+    closed["pnl"] = round(pnl, 2)
+    closed["close_time"] = datetime.now(timezone.utc).isoformat()
+    state["closed"].append(closed)
+    
+    equity = state["balance"] + sum(p["margin"] for p in state["positions"])
+    _save_paper(state)
+    
+    return {
+        "status": "closed",
+        "position": closed,
+        "pnl": round(pnl, 2),
+        "paper_balance": round(state["balance"], 2),
+        "paper_equity": round(equity, 2),
+    }
+
+def tool_paper_status(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Paper trading portfolio: balance, equity, open PnL, closed trades."""
+    state = _load_paper()
+    open_pnl = 0.0
+    positions_detail = []
+    
+    for p in state.get("positions", []):
+        try:
+            sym = _fix_sym(p["symbol"])
+            price_data = _mt5_direct({"action": "price", "symbol": sym})
+            if p["type"] == "BUY":
+                current_pnl = (price_data.get("bid", p["entry"]) - p["entry"]) * p["volume"] * 100000
+            else:
+                current_pnl = (p["entry"] - price_data.get("ask", p["entry"])) * p["volume"] * 100000
+            open_pnl += current_pnl
+            positions_detail.append({**p, "current_pnl": round(current_pnl, 2)})
+        except:
+            positions_detail.append({**p, "current_pnl": 0})
+    
+    equity = state["balance"] + open_pnl
+    total_invested = state["initial_balance"] - state["balance"] + sum(p["margin"] for p in state["positions"])
+    total_pnl = sum(c.get("pnl", 0) for c in state.get("closed", [])) + open_pnl
+    wins = len([c for c in state.get("closed", []) if c.get("pnl", 0) > 0])
+    losses = len([c for c in state.get("closed", []) if c.get("pnl", 0) <= 0])
+    
+    return {
+        "initial_balance": state["initial_balance"],
+        "available_balance": round(state["balance"], 2),
+        "equity": round(equity, 2),
+        "open_positions": len(state.get("positions", [])),
+        "closed_trades": len(state.get("closed", [])),
+        "open_pnl": round(open_pnl, 2),
+        "total_pnl": round(total_pnl, 2),
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(wins / (wins + losses) * 100, 1) if (wins + losses) > 0 else 0,
+        "positions": positions_detail,
+        "recent_closed": state.get("closed", [])[-5:] if state.get("closed") else [],
+    }
+
+def tool_paper_close_all(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Close all open paper positions."""
+    state = _load_paper()
+    results = []
+    for p in list(state.get("positions", [])):
+        result = tool_paper_close({"ticket": p["ticket"]})
+        results.append(result)
+    return {"closed": len(results), "results": results}
+
+
+# ── Realtime Scanner ──
+
+_SCANNER_THREAD = None
+_SCANNER_RESULTS = {"status": "idle", "last_scan": None, "signals": []}
+
+def tool_scanner_start(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Start real-time scanner in background. Scans symbols every N minutes."""
+    global _SCANNER_THREAD, _SCANNER_RESULTS
+    import threading
+    
+    if _SCANNER_THREAD and _SCANNER_THREAD.is_alive():
+        return {"status": "already_running"}
+    
+    symbols = args.get("symbols", ["EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD"])
+    interval_seconds = int(args.get("interval_seconds", 300))
+    min_confidence = int(args.get("min_confidence", 50))
+    max_spread = int(args.get("max_spread", 80))
+    
+    def _scan_loop():
+        global _SCANNER_RESULTS
+        while True:
+            try:
+                signals = []
+                for sym in symbols:
+                    try:
+                        s = _fix_sym(sym)
+                        price = _mt5_direct({"action": "price", "symbol": s})
+                        spread = price.get("spread", 99)
+                        if spread > max_spread:
+                            continue
+                        
+                        # Quick conviction check using intelligence
+                        if "conviction_decide" in _intelligence_tools:
+                            fn = _intelligence_tools["conviction_decide"][0]
+                            result = fn({"symbol": sym, "timeframe": "M5"})
+                            decision = result.get("decision", result)
+                            conf = decision.get("confidence_pct", decision.get("score", 0))
+                            verdict = decision.get("verdict", decision.get("direction", "PASS"))
+                            if verdict in ("BUY", "SELL") and conf >= min_confidence:
+                                signals.append({
+                                    "symbol": sym, "type": verdict,
+                                    "confidence": conf, "price": price.get("bid", 0),
+                                    "spread": spread, "time": datetime.now(timezone.utc).isoformat(),
+                                })
+                    except:
+                        pass
+                
+                signals.sort(key=lambda x: x["confidence"], reverse=True)
+                _SCANNER_RESULTS = {
+                    "status": "scanning",
+                    "last_scan": datetime.now(timezone.utc).isoformat(),
+                    "signals": signals,
+                    "symbols_scanned": len(symbols),
+                }
+            except Exception as e:
+                _SCANNER_RESULTS["last_error"] = str(e)
+            
+            # Wait
+            slept = 0
+            while slept < interval_seconds:
+                if not _SCANNER_THREAD or not _SCANNER_THREAD.is_alive():
+                    return
+                time.sleep(5)
+                slept += 5
+    
+    _SCANNER_THREAD = threading.Thread(target=_scan_loop, daemon=True)
+    _SCANNER_THREAD.start()
+    _SCANNER_RESULTS = {"status": "running", "interval": interval_seconds, "symbols": symbols}
+    return {"status": "started", "symbols": symbols, "interval_seconds": interval_seconds}
+
+def tool_scanner_stop(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Stop the real-time scanner."""
+    global _SCANNER_THREAD, _SCANNER_RESULTS
+    _SCANNER_THREAD = None
+    _SCANNER_RESULTS["status"] = "stopped"
+    return {"status": "stopped"}
+
+def tool_scanner_signals(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Get latest scanner signals."""
+    global _SCANNER_RESULTS
+    return _SCANNER_RESULTS if _SCANNER_RESULTS else {"status": "idle", "signals": []}
+
+
 def schema(props: Dict[str, Any], required: Optional[List[str]] = None) -> Dict[str, Any]:
     return {"type": "object", "properties": props, "required": required or []}
 
@@ -1899,6 +2181,34 @@ TOOLS: Dict[str, Tuple[Callable[[Dict[str, Any]], Dict[str, Any]], str, Dict[str
         "stop_loss": {"type": "number", "default": 0},
         "take_profit": {"type": "number", "default": 0},
     })),
+    "mt5_paper_init": (tool_paper_init, "Initialize/reset paper trading with virtual balance (default $1000).", schema({
+        "balance": {"type": "number", "default": 1000},
+    })),
+    "mt5_paper_buy": (tool_paper_buy, "Paper buy: simulate BUY with virtual money.", schema({
+        "symbol": {"type": "string", "default": "EURUSD"},
+        "volume": {"type": "number", "default": 0.01},
+        "stop_loss": {"type": "number", "default": 0},
+        "take_profit": {"type": "number", "default": 0},
+    })),
+    "mt5_paper_sell": (tool_paper_sell, "Paper sell: simulate SELL with virtual money.", schema({
+        "symbol": {"type": "string", "default": "EURUSD"},
+        "volume": {"type": "number", "default": 0.01},
+        "stop_loss": {"type": "number", "default": 0},
+        "take_profit": {"type": "number", "default": 0},
+    })),
+    "mt5_paper_close": (tool_paper_close, "Close a paper position by ticket.", schema({
+        "ticket": {"type": "integer"},
+    }, ["ticket"])),
+    "mt5_paper_status": (tool_paper_status, "Paper portfolio: balance, equity, open PnL, closed trades.", schema({})),
+    "mt5_paper_close_all": (tool_paper_close_all, "Close all open paper positions.", schema({})),
+    "mt5_scanner_start": (tool_scanner_start, "Start real-time background scanner. Checks symbols every N seconds.", schema({
+        "symbols": {"type": "array", "items": {"type": "string"}, "default": ["EURUSD","GBPUSD","USDJPY","USDCAD","AUDUSD"]},
+        "interval_seconds": {"type": "integer", "default": 300},
+        "min_confidence": {"type": "integer", "default": 50},
+        "max_spread": {"type": "integer", "default": 80},
+    })),
+    "mt5_scanner_stop": (tool_scanner_stop, "Stop the real-time background scanner.", schema({})),
+    "mt5_scanner_signals": (tool_scanner_signals, "Get latest scanner signals and status.", schema({})),
 }
 
 # Merge intelligence tools
