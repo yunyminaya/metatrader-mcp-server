@@ -260,17 +260,17 @@ def stealth_entry(client, symbol: str, order_type: str, volume: float,
             if order_type.upper() == "BUY":
                 current = ask
                 deviation = (base_price - current) / max(base_price, 0.0001) * 100
-                if deviation > 0:  # price dropped = better for BUY
-                    pass  # favorable
+                if deviation > 0:
+                    pass
                 elif abs(deviation) < price_deviation_pct:
-                    pass  # close enough
+                    pass
                 else:
                     time.sleep(random.uniform(1, 3))
                     continue
             else:
                 current = bid
                 deviation = (current - base_price) / max(base_price, 0.0001) * 100
-                if deviation > 0:  # price rose = better for SELL
+                if deviation > 0:
                     pass
                 elif abs(deviation) < price_deviation_pct:
                     pass

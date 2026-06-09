@@ -208,8 +208,8 @@ def tick(client) -> Dict[str, Any]:
         # papertrade initial margin approximation
         entry = result.get("position", {}).get("entry_price", 1)
         vol = best["lot"]
-        margin_est = vol * 100000 / max(entry, 0.0001)
-        record_trade(0 if result.get("success") else -margin_est, bal)
+        pnl_est = result.get("position", {}).get("pnl_pct", 0)
+        record_trade(pnl_est if isinstance(pnl_est, (int, float)) else 0, bal)
     except Exception:
         pass
 

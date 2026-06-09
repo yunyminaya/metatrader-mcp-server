@@ -79,7 +79,7 @@ def place_smart_order(client, symbol: str, order_type: str, volume: float = 0.01
     except Exception as e:
         return {"success": False, "error": f"Order failed: {e}"}
 
-    if not result or result.get("error", True):
+    if not result or result.get("error", False):
         return {"success": False, "error": f"Order rejected: {result}"}
 
     ticket = result.get("ticket") or result.get("data", {}).get("ticket")
@@ -104,9 +104,6 @@ def place_smart_order(client, symbol: str, order_type: str, volume: float = 0.01
 
     # Register for live monitoring
     try:
-        from . import guard as _guard_module
-
-        _state_key = "live_tracking"
         _ensure_guard_state()
     except Exception:
         pass

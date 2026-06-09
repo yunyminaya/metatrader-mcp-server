@@ -121,7 +121,10 @@ def run(client, symbol: str, timeframe: str = "H1", days: int = 30,
 
 def _check_entry(data, rule):
     """Checkea regla de entrada contra velas recientes."""
-    closes = [float(d["close"]) for d in data[-20:]]
+    if data and isinstance(data[0], dict):
+        closes = [float(d["close"]) for d in data[-20:]]
+    else:
+        closes = list(data)[-20:]
     if len(closes) < 14:
         return False
 
@@ -283,6 +286,7 @@ def walk_forward(client, symbol: str, timeframe: str = "H1",
         trades = []
         in_pos = False
         entry_price = 0
+        entry_idx = 0
 
         for i in range(20, len(test_data)):
             close = test_closes[i]
@@ -294,6 +298,7 @@ def walk_forward(client, symbol: str, timeframe: str = "H1",
                     if _check_entry(ctx_closes, entry_rule):
                         in_pos = True
                         entry_price = close
+                        entry_idx = i
             else:
                 should_exit = False
                 reason = ""
@@ -304,7 +309,7 @@ def walk_forward(client, symbol: str, timeframe: str = "H1",
                     should_exit, reason = True, "sl-5"
                 elif abs((close - entry_price) / entry_price) > 5:
                     should_exit, reason = True, "exit_after_5pct"
-                elif i - (test_data.index({"close": close}) if False else i) > 50:
+                elif i - entry_idx > 50:
                     should_exit, reason = True, "max_hold"
 
                 if should_exit:

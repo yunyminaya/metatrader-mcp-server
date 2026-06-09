@@ -135,6 +135,7 @@ def run_optimization(client, symbol: str, fast_mode: bool = True) -> Dict[str, A
 
     for params in param_sets:
         try:
+            entry_rule = f"rsi_oversold_{params.get('rsi_period', 14)}_{params.get('rsi_oversold', 30)}"
             bt = bt_run(client, symbol, "H1", 60, "rsi_oversold", "target_10", 1000, 0.01)
             if bt.get("success"):
                 bd = bt.get("backtest", {})

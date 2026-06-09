@@ -66,6 +66,7 @@ def get_orders(ctx: Context, from_date: Optional[str] = None, to_date: Optional[
 	df = client.history.get_orders_as_dataframe(from_date=from_date, to_date=to_date, group=symbol)
 	return df.to_csv() if hasattr(df, 'to_csv') else str(df)
 
+@mcp.tool()
 def get_candles_by_date(ctx: Context, symbol_name: str, timeframe: str, from_date: str = None, to_date: str = None) -> str:
 	"""Get candle data for a symbol in a given timeframe and date range as CSV. Date input in format: ISO 8601 or 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'."""
 	client = get_client(ctx)
@@ -146,7 +147,7 @@ def get_pending_orders_by_id(ctx: Context, id: Union[int, str]) -> list:
 	return df.to_csv() if hasattr(df, 'to_csv') else str(df)
 
 @mcp.tool()
-def place_market_order(ctx: Context, symbol: str, volume: float, type: str) -> dict:
+def place_market_order(ctx: Context, symbol: str, volume: float, order_type: str) -> dict:
 	"""
 	Place a market order. Parameters:
 		symbol: Symbol name (e.g., 'EURUSD')
@@ -154,10 +155,10 @@ def place_market_order(ctx: Context, symbol: str, volume: float, type: str) -> d
 		type: Order type ('BUY' or 'SELL')
 	"""
 	client = get_client(ctx)
-	return client.order.place_market_order(symbol=symbol, volume=volume, type=type)
+	return client.order.place_market_order(symbol=symbol, volume=volume, order_type=order_type)
 
 @mcp.tool()
-def place_pending_order(ctx: Context, symbol: str, volume: float, type: str, price: float, stop_loss: Optional[Union[int, float]] = 0.0, take_profit: Optional[Union[int, float]] = 0.0) -> dict:
+def place_pending_order(ctx: Context, symbol: str, volume: float, order_type: str, price: float, stop_loss: Optional[Union[int, float]] = 0.0, take_profit: Optional[Union[int, float]] = 0.0) -> dict:
 	"""
 	Place a pending order. Parameters:
 		symbol: Symbol name (e.g., 'EURUSD')
@@ -168,7 +169,7 @@ def place_pending_order(ctx: Context, symbol: str, volume: float, type: str, pri
 		take_profit (optional): Take profit price.
 	"""
 	client = get_client(ctx)
-	return client.order.place_pending_order(symbol=symbol, volume=volume, type=type, price=price, stop_loss=stop_loss, take_profit=take_profit)
+	return client.order.place_pending_order(symbol=symbol, volume=volume, order_type=order_type, price=price, stop_loss=stop_loss, take_profit=take_profit)
 
 @mcp.tool()
 def modify_position(ctx: Context, id: Union[int, str], stop_loss: Optional[Union[int, float]] = None, take_profit: Optional[Union[int, float]] = None) -> dict:
@@ -1332,6 +1333,233 @@ def evolution_status(ctx: Context) -> dict:
     """Get evolution status, current generation, comparison stats."""
     from metatrader_mcp.tools.evolution import status
     return status()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4) New Intelligence Tools — ML Pipeline, Fear & Greed, COT, Order Flow, etc.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Advanced ML Predictor (XGBoost) ──────────────────────────────────────────
+
+@mcp.tool()
+def ml_predictor_train(ctx: Context, force_retrain: bool = False) -> dict:
+    """Train advanced ML model (XGBoost/GradientBoosting) from papertrade history.
+    Trains separate models for London/NY/Asian sessions.
+    Replace `force_retrain=True` to ignore cached models."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.ml_predictor import train
+    return train(client, force_retrain)
+
+@mcp.tool()
+def ml_predictor_predict(ctx: Context, symbol: str) -> dict:
+    """Predict direction using trained ML model for current session.
+    Uses session-aware XGBoost or GradientBoosting model.
+    Falls back to Naive Bayes if sklearn not available."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.ml_predictor import predict
+    return predict(client, symbol)
+
+@mcp.tool()
+def ml_predictor_session_predict(ctx: Context, symbol: str, session: str) -> dict:
+    """Predict using a specific session model: london, ny, or asian."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.ml_predictor import session_predict
+    return session_predict(client, symbol, session)
+
+@mcp.tool()
+def ml_predictor_status(ctx: Context) -> dict:
+    """Get ML model status: trained sessions, accuracy, feature importance."""
+    from metatrader_mcp.tools.ml_predictor import status
+    return status()
+
+@mcp.tool()
+def ml_predictor_reset(ctx: Context) -> dict:
+    """Reset all trained ML models and training data."""
+    from metatrader_mcp.tools.ml_predictor import reset
+    return reset()
+
+
+# ── Feature Engineering ──────────────────────────────────────────────────────
+
+@mcp.tool()
+def features_generate(ctx: Context, symbol: str, timeframe: str = "H1") -> dict:
+    """Generate 200+ trading features from OHLCV data for ML training.
+    Includes rolling windows, ratios, z-scores, percentiles, pattern scores."""
+    client = get_client(ctx)
+    import pandas as pd
+    try:
+        df = client.market.get_candles_latest(symbol_name=symbol, timeframe=timeframe, count=200)
+        candles = []
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            for _, row in df.iterrows():
+                candles.append(row.to_dict())
+    except Exception:
+        candles = []
+    from metatrader_mcp.tools.features import generate_from_ohlcv
+    features = generate_from_ohlcv(candles)
+    return {
+        "success": True,
+        "symbol": symbol,
+        "feature_count": len(features),
+        "features": {k: round(v, 6) if isinstance(v, float) else v for k, v in features.items()},
+    }
+
+
+# ── Fear & Greed Index ───────────────────────────────────────────────────────
+
+@mcp.tool()
+def fear_greed_index(ctx: Context) -> dict:
+    """Get current Fear & Greed Index (0-100). Extreme Fear = BUY opp, Extreme Greed = REDUCE risk."""
+    from metatrader_mcp.tools.fear_greed import fetch
+    return fetch()
+
+@mcp.tool()
+def fear_greed_analyze(ctx: Context, symbol: str) -> dict:
+    """Analyze Fear & Greed for a symbol, including risk modulation advice."""
+    from metatrader_mcp.tools.fear_greed import analyze
+    return analyze(symbol)
+
+
+# ── Commitment of Traders (COT) ──────────────────────────────────────────────
+
+@mcp.tool()
+def cot_analyze(ctx: Context, symbol: str) -> dict:
+    """Analyze COT (Commitment of Traders) institutional positioning.
+    Commercials = smart money. Their divergence from speculators = strong signal."""
+    from metatrader_mcp.tools.cot import analyze
+    return analyze(symbol)
+
+@mcp.tool()
+def cot_all(ctx: Context) -> dict:
+    """Get COT data for all available currencies."""
+    from metatrader_mcp.tools.cot import get_all
+    return get_all()
+
+
+# ── Order Flow Imbalance ─────────────────────────────────────────────────────
+
+@mcp.tool()
+def orderflow_check(ctx: Context, symbol: str) -> dict:
+    """Analyze tick-level order flow: Cumulative Volume Delta, imbalance ratio,
+    absorption, and exhaustion patterns. Requires tick data from MT5."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.orderflow import check
+    return check(client, symbol)
+
+@mcp.tool()
+def orderflow_imbalance(ctx: Context, symbol: str) -> dict:
+    """Quick order flow imbalance check — lighter version of orderflow_check."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.orderflow import get_imbalance
+    return get_imbalance(client, symbol)
+
+
+# ── Economic Calendar ────────────────────────────────────────────────────────
+
+@mcp.tool()
+def econ_calendar(ctx: Context, days_ahead: int = 7) -> dict:
+    """Fetch upcoming economic events with impact levels.
+    High-impact events (NFP, FOMC, CPI) may halt trading."""
+    from metatrader_mcp.tools.econ_calendar import fetch
+    return fetch(days_ahead)
+
+@mcp.tool()
+def econ_calendar_check(ctx: Context, symbol: str, hours_window: int = 48) -> dict:
+    """Check for upcoming high-impact events relevant to a symbol.
+    Returns HALT_TRADING / REDUCE_SIZE / CAUTION / NORMAL advice."""
+    from metatrader_mcp.tools.econ_calendar import check_events
+    return check_events(symbol, hours_window)
+
+
+# ── Portfolio Risk Engine (VaR, Risk Parity) ─────────────────────────────────
+
+@mcp.tool()
+def risk_portfolio_var(ctx: Context, confidence: float = 0.95) -> dict:
+    """Calculate Value at Risk (VaR) for the current portfolio.
+    confidence=0.95 for 95% VaR, 0.99 for 99% VaR."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.risk_engine import portfolio_var
+    return portfolio_var(client, confidence)
+
+@mcp.tool()
+def risk_parity_suggestions(ctx: Context) -> dict:
+    """Suggest position size adjustments for risk parity.
+    Uses inverse volatility weighting to balance risk across positions."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.risk_engine import risk_parity_suggestions
+    return risk_parity_suggestions(client)
+
+@mcp.tool()
+def risk_correlation_analysis(ctx: Context) -> dict:
+    """Detect correlation concentration risk in current positions.
+    Warns if >30% of portfolio is in highly correlated pairs."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.risk_engine import correlation_risk
+    return correlation_risk(client)
+
+@mcp.tool()
+def risk_drawdown_analysis(ctx: Context) -> dict:
+    """Analyze max drawdown and suggest position size limits.
+    Uses Kelly criterion and historical drawdown analysis."""
+    from metatrader_mcp.tools.risk_engine import max_drawdown_analysis
+    return max_drawdown_analysis()
+
+
+# ── Cross-Asset Correlation ─────────────────────────────────────────────────
+
+@mcp.tool()
+def correlation_cross_asset(ctx: Context, symbol: str) -> dict:
+    """Get correlation of symbol with DXY, SPX, Gold, US10Y, Oil.
+    Detects divergences when normal relationships break down."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.correlation import cross_asset_correlation
+    return cross_asset_correlation(client, symbol)
+
+
+# ── Reinforcement Learning Agent ────────────────────────────────────────────
+
+@mcp.tool()
+def rl_configure(ctx: Context, alpha: float = 0.1, gamma: float = 0.9,
+                 epsilon: float = 0.2, epsilon_decay: float = 0.995,
+                 min_epsilon: float = 0.01) -> dict:
+    """Configure RL agent hyperparameters.
+    alpha=learning_rate, gamma=discount, epsilon=exploration."""
+    from metatrader_mcp.tools.rl_agent import configure
+    return configure(alpha, gamma, epsilon, epsilon_decay, min_epsilon)
+
+@mcp.tool()
+def rl_train(ctx: Context, episodes: int = 100, symbol: str = "EURUSD") -> dict:
+    """Train the Reinforcement Learning agent via Q-learning.
+    Uses real market data from MT5 if available, otherwise simulated."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.rl_agent import train
+    return train(episodes, client, symbol)
+
+@mcp.tool()
+def rl_decide(ctx: Context, symbol: str) -> dict:
+    """Get RL agent's optimal action: HOLD, BUY, SELL, CLOSE_LONG, CLOSE_SHORT, ADD_TO_WINNER."""
+    client = get_client(ctx)
+    from metatrader_mcp.tools.rl_agent import decide
+    return decide(client, symbol)
+
+@mcp.tool()
+def rl_record_outcome(ctx: Context, reward: float) -> dict:
+    """Record outcome reward for online RL learning.
+    Call after each trade closes with the PnL as reward."""
+    from metatrader_mcp.tools.rl_agent import record_outcome
+    return record_outcome(reward)
+
+@mcp.tool()
+def rl_status(ctx: Context) -> dict:
+    """Get RL agent status: episodes, Q-table coverage, action preferences."""
+    from metatrader_mcp.tools.rl_agent import status
+    return status()
+
+@mcp.tool()
+def rl_reset(ctx: Context) -> dict:
+    """Reset RL agent — clear Q-table and start fresh."""
+    from metatrader_mcp.tools.rl_agent import reset
+    return reset()
 
 
 if __name__ == "__main__":

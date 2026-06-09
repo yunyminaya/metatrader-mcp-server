@@ -164,7 +164,18 @@ def analyze(symbol: str) -> Dict[str, Any]:
         if ext_info:
             mid = ext_info.get("mid", 0)
             if mid > 0:
-                direction = 1  # assume rising
+                # Compare with last known price to determine direction
+                last_prices = _state.get("_price_history", {}).get(ext_sym, [])
+                is_rising = True
+                if len(last_prices) >= 2:
+                    is_rising = last_prices[-1] > last_prices[-2]
+                else:
+                    is_rising = True
+                if ext_sym not in _state.setdefault("_price_history", {}):
+                    _state["_price_history"][ext_sym] = []
+                _state["_price_history"][ext_sym].append(mid)
+                _state["_price_history"][ext_sym] = _state["_price_history"][ext_sym][-5:]
+                direction = 1 if is_rising else -1
                 total_direction += direction * live_corr
                 bias_adjustments.append({
                     "market": ext_sym,

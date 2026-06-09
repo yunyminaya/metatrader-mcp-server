@@ -97,15 +97,20 @@ def check(client) -> Dict[str, Any]:
     # 3. Check SL/TP para papertrade (simulado)
     for p in paper_positions:
         try:
-            price_info = client.account.get_account()
-            current_price = price_info.get("balance", 0)
+            sym = p.get("symbol", "")
+            price_info = client.market.get_symbol_price(symbol_name=sym)
+            if not price_info:
+                continue
+            direction = 1 if p.get("type") == "BUY" else -1
+            current_price = price_info.get("bid") if direction == 1 else price_info.get("ask")
+            if not current_price:
+                continue
         except Exception:
             continue
 
         entry = p.get("entry_price", 0)
         sl = p.get("stop_loss", 0)
         tp = p.get("take_profit", 0)
-        direction = 1 if p.get("type") == "BUY" else -1
 
         if sl and direction * (current_price - sl) <= 0:
             try:

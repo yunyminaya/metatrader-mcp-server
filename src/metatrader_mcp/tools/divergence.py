@@ -71,7 +71,7 @@ def check_divergence(closes, highs, lows, window=5) -> Dict[str, Any]:
     """Check for regular bull/bear divergence using RSI and MACD."""
     n = len(closes)
     if n < 30:
-        return {"bullish_divergent": False, "bearish_divergent": False, "details": "too_short"}
+        return {"success": True, "bullish_divergent": False, "bearish_divergent": False, "details": "too_short"}
 
     rsi = _rsi_series(closes)
     macd_h = _macd_series(closes)
@@ -79,7 +79,7 @@ def check_divergence(closes, highs, lows, window=5) -> Dict[str, Any]:
     rsi_hi, rsi_li = _find_pivots(rsi, window)
     macd_hi, macd_li = _find_pivots(macd_h, window)
 
-    results = {"bullish_divergent": False, "bearish_divergent": False, "sources": []}
+    results = {"success": True, "bullish_divergent": False, "bearish_divergent": False, "sources": []}
 
     # Regular Bullish Divergence: price makes lower low, RSI/MACD makes higher low
     if len(li) >= 2 and len(rsi_li) >= 2:

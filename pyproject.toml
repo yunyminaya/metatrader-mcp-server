@@ -44,6 +44,13 @@ dependencies = [
   "websockets>=13.0",
 ]
 
+[project.optional-dependencies]
+client = []
+ml = [
+  "scikit-learn>=1.3.0",
+  "xgboost>=1.7.0",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["metatrader_mcp*", "metatrader_client*", "metatrader_openapi*", "metatrader_quote*"]
@@ -51,9 +58,6 @@ include = ["metatrader_mcp*", "metatrader_client*", "metatrader_openapi*", "meta
 [project.urls]
 "Homepage" = "https://github.com/ariadng/metatrader-mcp-server"
 "Bug Tracker" = "https://github.com/ariadng/metatrader-mcp-server/issues"
-
-[project.optional-dependencies]
-client = []
 
 [project.scripts]
 "metatrader-mcp-server" = "metatrader_mcp.cli:main"

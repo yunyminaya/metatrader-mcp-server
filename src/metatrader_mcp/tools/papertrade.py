@@ -50,11 +50,12 @@ def open_order(client, symbol: str, order_type: str, volume: float = 0.01,
 
     if not entry_price:
         try:
-            price_data = client.account.get_account()
-            if order_type.upper() == "BUY":
-                entry_price = price_data.get("balance", 0)
-            else:
-                entry_price = price_data.get("balance", 0)
+            price_data = client.market.get_symbol_price(symbol_name=symbol)
+            if price_data:
+                if order_type.upper() == "BUY":
+                    entry_price = price_data.get("ask", 0)
+                else:
+                    entry_price = price_data.get("bid", 0)
         except Exception:
             entry_price = 1.0
 
@@ -91,8 +92,12 @@ def close_order(client, position_id: int, exit_price: float = 0) -> Dict[str, An
         if pos.get("id") == position_id and pos.get("status") == "open":
             if not exit_price:
                 try:
-                    price_data = client.account.get_account()
-                    exit_price = price_data.get("balance", pos["entry_price"])
+                    price_data = client.market.get_symbol_price(symbol_name=pos["symbol"])
+                    if price_data:
+                        if pos["type"] == "BUY":
+                            exit_price = price_data.get("bid", pos["entry_price"])
+                        else:
+                            exit_price = price_data.get("ask", pos["entry_price"])
                 except Exception:
                     exit_price = pos["entry_price"]
 

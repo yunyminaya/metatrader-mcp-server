@@ -6,7 +6,7 @@ from ..client_market import MT5Market
 def place_pending_order(
 	connection,
 	*,
-	type: str,
+	order_type: str,
 	symbol: str,
 	volume: Union[float, int],
 	price: Union[float, int],
@@ -24,7 +24,7 @@ def place_pending_order(
 
 	Args:
 		connection: MetaTrader 5 connection object.
-		type: The type of order, either 'BUY' or 'SELL'.
+		order_type: The type of order, either 'BUY' or 'SELL'.
 		symbol: The trading instrument name (e.g., "EURUSD").
 		volume: The trade volume in lots.
 		price: The price at which to place the pending order.
@@ -35,27 +35,27 @@ def place_pending_order(
 		A dictionary with the result of the order placement. If successful,
 		it contains an order ID. Otherwise, it contains an error message.
 	"""
-	
+
 	accepted_types  = ["BUY", "SELL"]
-	if type not in accepted_types:
+	if order_type not in accepted_types:
 		return { "error": True, "message": f"Invalid type, should be BUY or SELL.", "data": None }
-	
+
 	market = MT5Market(connection)
 	current_price = market.get_symbol_price(symbol_name=symbol)
 	if current_price is None:
 		return { "error": True, "message": f"Cannot get latest market price for {symbol}", "data": None }
-	
-	order_type = None
+
+	pending_type = None
 	price = float(price)
-	if type == "BUY":
-		order_type = "BUY_LIMIT" if current_price["ask"] > price else "BUY_STOP"
+	if order_type == "BUY":
+		pending_type = "BUY_LIMIT" if current_price["ask"] > price else "BUY_STOP"
 	else:
-		order_type = "SELL_LIMIT" if current_price["bid"] < price else "SELL_STOP"
+		pending_type = "SELL_LIMIT" if current_price["bid"] < price else "SELL_STOP"
 
 	response = send_order(
 		connection,
 		action = TradeRequestActions.PENDING,
-		order_type = order_type,
+		order_type = pending_type,
 		symbol = symbol,
 		volume = float(volume),
 		price = float(price),
@@ -68,6 +68,6 @@ def place_pending_order(
 
 	return {
 		"error": False,
-		"message": f"Place pending order {order_type} {symbol} {volume} LOT at {price} success (Order ID: {response['data'].order})",
+		"message": f"Place pending order {pending_type} {symbol} {volume} LOT at {price} success (Order ID: {response['data'].order})",
 		"data": response["data"],
 	}

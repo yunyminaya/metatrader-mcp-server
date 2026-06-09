@@ -71,6 +71,7 @@ def smart_stop_loss(entry_price: float, direction: int, atr: float,
         base_sl = entry_price + atr_distance
 
     result = {
+        "success": True,
         "base_sl": round(base_sl, 5),
         "adjusted_sl": round(base_sl, 5),
         "adjustments": [],

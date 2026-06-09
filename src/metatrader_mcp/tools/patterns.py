@@ -266,12 +266,12 @@ def detect_all(candles: List[Dict]) -> Dict[str, Any]:
         # Rising Three / Falling Three
         if _is_bullish(o[a], cl[a]) and _is_bullish(o[cur], cl[cur]):
             if all(_is_bearish(o[i], cl[i]) for i in range(b, cur)):
-                if all(cl[b:cur], key=lambda x: x) < cl[a] and cl[cur] > h[a]:
+                if all(x < cl[a] for x in cl[b:cur]) and cl[cur] > h[a]:
                     patterns.append(_p("rising_three", "bullish", 4, cur))
 
         if _is_bearish(o[a], cl[a]) and _is_bearish(o[cur], cl[cur]):
             if all(_is_bullish(o[i], cl[i]) for i in range(b, cur)):
-                if all(cl[b:cur], key=lambda x: x) > cl[a] and cl[cur] < l[a]:
+                if all(x > cl[a] for x in cl[b:cur]) and cl[cur] < l[a]:
                     patterns.append(_p("falling_three", "bearish", 4, cur))
 
     # Deduplicate: keep strongest pattern per index
