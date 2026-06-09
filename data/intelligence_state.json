@@ -1,0 +1,9 @@
+{
+  "trade_db": [],
+  "_strategy_state": {},
+  "_current_strategy": "conviction",
+  "_evolution": {
+    "generation": 1,
+    "params": {}
+  }
+}

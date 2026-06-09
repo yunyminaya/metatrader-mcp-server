@@ -12,8 +12,10 @@ from typing import Dict, List, Tuple, Union, Optional
 
 try:
     import MetaTrader5 as mt5
+    _MT5_AVAILABLE = True
 except ImportError:
-    raise ImportError("MetaTrader5 package is not installed. Please install it with: pip install MetaTrader5")
+    mt5 = None
+    _MT5_AVAILABLE = False
 
 from metatrader_client.exceptions import ConnectionError, InitializationError, LoginError, DisconnectionError
 from .connection import (

@@ -8,8 +8,10 @@ import logging
 
 try:
     import MetaTrader5 as mt5
+    _MT5_AVAILABLE = True
 except ImportError:
-    raise ImportError("MetaTrader5 package is not installed. Please install it with: pip install MetaTrader5")
+    mt5 = None
+    _MT5_AVAILABLE = False
 
 from .exceptions import AccountError, AccountInfoError, TradingNotAllowedError, MarginLevelError, ConnectionError
 from .account import (
