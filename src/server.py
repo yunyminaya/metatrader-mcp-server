@@ -15,7 +15,6 @@ Features:
 
 import asyncio
 import json
-import sqlite3
 import signal
 import sys
 import threading
@@ -25,38 +24,43 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
-import numpy as np
 from mcp.server.fastmcp import FastMCP, Context
-from sklearn.ensemble import RandomForestClassifier
-import joblib
 
-# Importar módulos locales
-from database import TradingDatabase
-from risk_manager import RiskManager
-from ml_local import LocalMLScorer
-from notifier import TelegramNotifier
-from mt5_client import MT5Client
-from daemon_trading import DaemonTrading
+# Importar módulos locales (relativos al paquete)
+try:
+    from .database import TradingDatabase
+    from .risk_manager import RiskManager
+    from .ml_local import LocalMLScorer
+    from .notifier import TelegramNotifier, ConsoleNotifier
+    from .mt5_client import MT5Client
+    from .daemon_trading import DaemonTrading
+except ImportError:
+    # Fallback para ejecución directa: python src/server.py
+    from database import TradingDatabase
+    from risk_manager import RiskManager
+    from ml_local import LocalMLScorer
+    from notifier import TelegramNotifier, ConsoleNotifier
+    from mt5_client import MT5Client
+    from daemon_trading import DaemonTrading
 
-# Crear servidor MCP
-mcp = FastMCP("metatrader-autonomous")
-
-# Variables globales para el estado
-db: Optional[TradingDatabase] = None
-risk_mgr: Optional[RiskManager] = None
-ml_scorer: Optional[LocalMLScorer] = None
-notifier: Optional[TelegramNotifier] = None
-mt5: Optional[MT5Client] = None
-daemon: Optional[DaemonTrading] = None
 
 # ============================================================
 # LIFECYCLE
 # ============================================================
 
+# Variables globales para el estado (usadas por el lifespan)
+_db: Optional[TradingDatabase] = None
+_risk_mgr: Optional[RiskManager] = None
+_ml_scorer: Optional[LocalMLScorer] = None
+_notifier: Optional[Any] = None  # TelegramNotifier o ConsoleNotifier
+_mt5: Optional[MT5Client] = None
+_daemon: Optional[DaemonTrading] = None
+
+
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[Dict]:
     """Maneja el ciclo de vida del servidor."""
-    global db, risk_mgr, ml_scorer, notifier, mt5, daemon
+    global _db, _risk_mgr, _ml_scorer, _notifier, _mt5, _daemon
 
     # Cargar configuración
     config_path = Path.home() / ".metatrader-mcp" / "config.json"
@@ -68,49 +72,60 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[Dict]:
 
     # Inicializar componentes
     db_path = Path.home() / ".metatrader-mcp" / "trading.db"
-    db = TradingDatabase(str(db_path))
-    db.init_tables()
+    _db = TradingDatabase(str(db_path))
+    _db.init_tables()
 
-    risk_mgr = RiskManager(db, config.get("riesgo", {}))
-    ml_scorer = LocalMLScorer(db)
+    _risk_mgr = RiskManager(_db, config.get("riesgo", {}))
+    _ml_scorer = LocalMLScorer(_db)
 
     telegram_token = config.get("telegram", {}).get("token")
     telegram_chat = config.get("telegram", {}).get("chat_id")
     if telegram_token and telegram_chat:
-        notifier = TelegramNotifier(telegram_token, telegram_chat)
+        _notifier = TelegramNotifier(telegram_token, telegram_chat)
+    else:
+        _notifier = ConsoleNotifier()
 
     # Conectar a MT5
-    mt5 = MT5Client(
+    _mt5 = MT5Client(
         login=config.get("mt5", {}).get("login"),
         password=config.get("mt5", {}).get("password"),
         server=config.get("mt5", {}).get("server"),
         path=config.get("mt5", {}).get("path")
     )
-    mt5.connect()
+    _mt5.connect()
 
     # Iniciar modo daemon si está configurado
     if config.get("autonomo", False):
-        daemon = DaemonTrading(mt5, db, risk_mgr, ml_scorer, notifier, config)
-        daemon.start()
-        if notifier:
-            await notifier.send("🤖 MetaTrader MCP Autónomo iniciado")
+        _daemon = DaemonTrading(_mt5, _db, _risk_mgr, _ml_scorer, _notifier, config)
+        _daemon.start()
+        if _notifier:
+            try:
+                await _notifier.send("🤖 MetaTrader MCP Autónomo iniciado")
+            except Exception:
+                pass
 
     yield {
-        "db": db,
-        "mt5": mt5,
-        "daemon": daemon,
+        "db": _db,
+        "mt5": _mt5,
+        "daemon": _daemon,
+        "risk_mgr": _risk_mgr,
+        "ml_scorer": _ml_scorer,
+        "notifier": _notifier,
         "config": config
     }
 
     # Cleanup
-    if daemon:
-        daemon.stop()
-    if mt5:
-        mt5.disconnect()
-    if db:
-        db.close()
+    if _daemon:
+        _daemon.stop()
+    if _mt5:
+        _mt5.disconnect()
+    if _db:
+        _db.close()
 
+
+# Crear servidor MCP - UNA SOLA INSTANCIA con lifespan
 mcp = FastMCP("metatrader-autonomous", lifespan=app_lifespan)
+
 
 # ============================================================
 # TOOLS - INFORMACIÓN DE CUENTA
@@ -190,7 +205,6 @@ def close_all_positions(ctx: Context, symbol: Optional[str] = None) -> Dict[str,
 def close_profitable_positions(ctx: Context, min_profit: float = 0) -> Dict[str, Any]:
     """Cerrar solo posiciones con beneficio >= min_profit."""
     mt5_client = ctx.request_context.lifespan_context["mt5"]
-    db = ctx.request_context.lifespan_context["db"]
 
     positions = mt5_client.get_positions()
     closed = []
@@ -418,12 +432,15 @@ def start_autonomous_mode(ctx: Context,
         daemon.start()
 
     if notifier:
-        asyncio.create_task(notifier.send(
-            f"🚀 Modo autónomo iniciado\n"
-            f"Símbolos: {', '.join(symbols)}\n"
-            f"Estrategia: {strategy}\n"
-            f"Riesgo: {risk_per_trade}% por trade"
-        ))
+        try:
+            asyncio.create_task(notifier.send(
+                f"🚀 Modo autónomo iniciado\n"
+                f"Símbolos: {', '.join(symbols)}\n"
+                f"Estrategia: {strategy}\n"
+                f"Riesgo: {risk_per_trade}% por trade"
+            ))
+        except Exception:
+            pass
 
     return {"success": True, "config": config}
 
@@ -437,7 +454,10 @@ def stop_autonomous_mode(ctx: Context) -> Dict[str, Any]:
         daemon.stop()
 
         if notifier:
-            asyncio.create_task(notifier.send("🛑 Modo autónomo detenido"))
+            try:
+                asyncio.create_task(notifier.send("🛑 Modo autónomo detenido"))
+            except Exception:
+                pass
 
         return {"success": True, "message": "Modo autónomo detenido"}
 
@@ -452,7 +472,7 @@ def force_cycle_now(ctx: Context) -> Dict[str, Any]:
         return {"success": False, "error": "Daemon no está corriendo"}
 
     # Ejecutar ciclo inmediatamente
-    threading.Thread(target=daemon.force_cycle).start()
+    threading.Thread(target=daemon.force_cycle, daemon=True).start()
 
     return {"success": True, "message": "Ciclo forzado iniciado"}
 
@@ -465,13 +485,14 @@ def get_risk_metrics(ctx: Context) -> Dict[str, Any]:
     """Obtener métricas de riesgo actuales (drawdown, etc)."""
     db = ctx.request_context.lifespan_context["db"]
     risk_mgr = ctx.request_context.lifespan_context.get("risk_mgr")
+    mt5_client = ctx.request_context.lifespan_context["mt5"]
 
     return {
         "daily_drawdown": risk_mgr.get_daily_drawdown() if risk_mgr else 0,
         "daily_loss": risk_mgr.get_daily_loss() if risk_mgr else 0,
         "consecutive_losses": risk_mgr.get_consecutive_losses() if risk_mgr else 0,
         "circuit_breaker_active": risk_mgr.is_circuit_breaker_active() if risk_mgr else False,
-        "open_positions_count": len(ctx.request_context.lifespan_context["mt5"].get_positions())
+        "open_positions_count": len(mt5_client.get_positions())
     }
 
 @mcp.tool()
@@ -505,11 +526,14 @@ def emergency_stop(ctx: Context) -> Dict[str, Any]:
     mt5_client.cancel_all_orders()
 
     if notifier:
-        asyncio.create_task(notifier.send(
-            f"🚨 EMERGENCY STOP ACTIVADO\n"
-            f"Posiciones cerradas: {len(positions)}\n"
-            f"Todas las órdenes canceladas"
-        ))
+        try:
+            asyncio.create_task(notifier.send(
+                f"🚨 EMERGENCY STOP ACTIVADO\n"
+                f"Posiciones cerradas: {len(positions)}\n"
+                f"Todas las órdenes canceladas"
+            ))
+        except Exception:
+            pass
 
     return {
         "success": True,
@@ -605,11 +629,130 @@ def export_trades_csv(ctx: Context, filepath: str, days: int = 30) -> Dict[str, 
     }
 
 # ============================================================
+# TOOLS — ESTRATEGIA FÉNIX $5
+# ============================================================
+
+@mcp.tool()
+def run_fenix_5usd(ctx: Context, dry_run: bool = True) -> Dict[str, Any]:
+    """Ejecuta la estrategia Fénix con objetivo de $5 de ganancia.
+    Usa dry_run=False solo con autorización explícita del usuario."""
+    import subprocess
+    import os
+
+    script = str(Path.home() / "Robo MQL5" / "fenix_5usd.py")
+    flag = "--dry-run" if dry_run else "--live"
+    mode_label = "DRY-RUN" if dry_run else "LIVE"
+
+    if not dry_run:
+        return {
+            "error": "Para ejecutar en real escribe: 'SI OPERAR' directamente en la terminal con --live"
+        }
+
+    if not Path(script).exists():
+        return {"error": f"Script no encontrado: {script}"}
+
+    try:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = (
+            str(Path.home() / "Robo MQL5" / "scripts")
+            + ":" + str(Path.home() / "Desktop/metatrader-mcp-server/src")
+        )
+        result = subprocess.run(
+            [sys.executable, script, flag],
+            capture_output=True, text=True, timeout=120, env=env
+        )
+        return {
+            "mode": mode_label,
+            "output": result.stdout[-2000:] if result.stdout else "",
+            "errors": result.stderr[-500:] if result.stderr else "",
+            "returncode": result.returncode
+        }
+    except subprocess.TimeoutExpired:
+        return {"mode": mode_label, "output": "Timeout — estrategia corriendo en background"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def fenix_market_scan(ctx: Context) -> Dict[str, Any]:
+    """Analiza EURUSD y GBPUSD en M15 con EMA8/21 + RSI. Devuelve señales activas."""
+    mt5_client = ctx.request_context.lifespan_context["mt5"]
+
+    try:
+        signals = []
+        for sym in ["EURUSD", "GBPUSD"]:
+            rates_raw = mt5_client.get_candles(sym, "M15", 60)
+            if not rates_raw or len(rates_raw) < 25:
+                continue
+
+            closes = [r["close"] for r in rates_raw]
+
+            # EMA calculation
+            def ema_calc(data, n):
+                k = 2 / (n + 1)
+                e = [data[0]]
+                for p in data[1:]:
+                    e.append(p * k + e[-1] * (1 - k))
+                return e
+
+            # RSI calculation
+            def rsi_calc(closes_data, n=14):
+                if len(closes_data) < n + 1:
+                    return 50.0
+                diffs = [closes_data[i] - closes_data[i - 1] for i in range(1, len(closes_data))]
+                g = [max(d, 0) for d in diffs[-n:]]
+                l = [abs(min(d, 0)) for d in diffs[-n:]]
+                ag, al = sum(g) / n, sum(l) / n
+                return 100 - (100 / (1 + ag / al)) if al else 100.0
+
+            e8 = ema_calc(closes, 8)
+            e21 = ema_calc(closes, 21)
+            r = rsi_calc(closes)
+            prev_r = rsi_calc(closes[:-1])
+
+            tick = mt5_client.get_tick(sym)
+            info = mt5_client.get_symbol_info(sym)
+
+            if not tick or not info:
+                continue
+
+            pip = info.get("point", 0.00001) * 10
+            spread = round((tick["ask"] - tick["bid"]) / pip, 1) if tick else 0
+
+            entry = None
+            if e8[-2] < e21[-2] and e8[-1] > e21[-1] and prev_r < 32 and r >= 32:
+                entry = "BUY"
+            elif e8[-2] > e21[-2] and e8[-1] < e21[-1] and prev_r > 68 and r <= 68:
+                entry = "SELL"
+
+            signals.append({
+                "symbol": sym,
+                "price": tick.get("bid", 0),
+                "ema8_above_21": e8[-1] > e21[-1],
+                "rsi": round(r, 1),
+                "spread_pips": spread,
+                "signal": entry or "ESPERAR"
+            })
+
+        account = mt5_client.get_account_info()
+        return {
+            "account": {
+                "balance": account.get("balance", 0),
+                "equity": account.get("equity", 0),
+                "target": account.get("balance", 0) + 5
+            },
+            "signals": signals
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
-if __name__ == "__main__":
-    # Parsear argumentos
+def main():
+    """Punto de entrada principal."""
     import argparse
 
     parser = argparse.ArgumentParser(description="MetaTrader MCP Server - Autonomous Mode")
@@ -635,3 +778,7 @@ if __name__ == "__main__":
         mcp.run(transport="stdio")
     else:
         mcp.run(transport="sse", host=args.host, port=args.port)
+
+
+if __name__ == "__main__":
+    main()

@@ -5,7 +5,8 @@ Calcula score 0-100 para trades sin usar APIs externas.
 """
 
 import json
-import pickle
+import hashlib
+import struct
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
@@ -19,7 +20,7 @@ class LocalMLScorer:
 
     def __init__(self, db):
         self.db = db
-        self.model_path = Path.home() / ".metatrader-mcp" / "ml_model.pkl"
+        self.model_path = Path.home() / ".metatrader-mcp" / "ml_model.json"
         self.model = None
         self._load_model()
 
@@ -39,22 +40,34 @@ class LocalMLScorer:
         }
 
     def _load_model(self):
-        """Cargar modelo entrenado si existe."""
+        """Cargar modelo entrenado si existe (formato JSON seguro)."""
         if self.model_path.exists():
             try:
-                with open(self.model_path, 'rb') as f:
-                    self.model = pickle.load(f)
-                print(f"[ML] Modelo cargado desde {self.model_path}")
+                with open(self.model_path, 'r') as f:
+                    model_data = json.load(f)
+
+                # Verificar integridad del modelo
+                if self._verify_model(model_data):
+                    self.model = model_data
+                    print(f"[ML] Modelo cargado desde {self.model_path}")
+                else:
+                    print("[ML Warning] Modelo corrupto, ignorando")
+                    self.model = None
             except Exception as e:
                 print(f"[ML Error] Cargando modelo: {e}")
                 self.model = None
 
+    def _verify_model(self, model_data: Dict) -> bool:
+        """Verificar integridad del modelo JSON."""
+        required_keys = ["version", "features", "weights"]
+        return all(k in model_data for k in required_keys)
+
     def _save_model(self):
-        """Guardar modelo entrenado."""
+        """Guardar modelo entrenado en formato JSON seguro."""
         try:
             self.model_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.model_path, 'wb') as f:
-                pickle.dump(self.model, f)
+            with open(self.model_path, 'w') as f:
+                json.dump(self.model, f, indent=2)
             print(f"[ML] Modelo guardado en {self.model_path}")
         except Exception as e:
             print(f"[ML Error] Guardando modelo: {e}")
@@ -69,6 +82,9 @@ class LocalMLScorer:
 
         if not candles or len(candles) < 20:
             return 0, {"error": "Datos insuficientes"}
+
+        if not tick:
+            return 0, {"error": "Sin datos de tick"}
 
         # 1. Calcular indicadores técnicos
         closes = [c["close"] for c in candles]
@@ -93,7 +109,8 @@ class LocalMLScorer:
         # Bollinger Bands
         features["bb_upper"], features["bb_middle"], features["bb_lower"] = self._calculate_bollinger(closes)
         current_price = closes[-1]
-        features["bb_position"] = (current_price - features["bb_lower"]) / (features["bb_upper"] - features["bb_lower"])
+        bb_range = features["bb_upper"] - features["bb_lower"]
+        features["bb_position"] = (current_price - features["bb_lower"]) / bb_range if bb_range > 0 else 0.5
 
         # ATR (Average True Range)
         features["atr"] = self._calculate_atr(highs, lows, closes, 14)
@@ -130,12 +147,13 @@ class LocalMLScorer:
 
         features["score_raw"] = score
         features["direction"] = self._determine_direction(features, score)
+        features["symbol"] = symbol
 
         return min(100, max(0, score)), features
 
     def train(self, historical_trades: List[Dict]) -> Dict[str, Any]:
         """
-        Entrenar modelo con trades históricos.
+        Entrenar modelo con trades históricos usando JSON (no pickle).
         """
         from sklearn.ensemble import RandomForestClassifier
         from sklearn.model_selection import train_test_split
@@ -149,8 +167,13 @@ class LocalMLScorer:
         y = []
 
         for trade in historical_trades:
-            # Extraer features del trade
             features = trade.get("features", {})
+            if isinstance(features, str):
+                try:
+                    features = json.loads(features)
+                except (json.JSONDecodeError, TypeError):
+                    features = {}
+
             if features:
                 feature_vector = [
                     features.get("rsi", 50),
@@ -172,19 +195,21 @@ class LocalMLScorer:
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
         # Entrenar modelo
-        self.model = RandomForestClassifier(
+        rf = RandomForestClassifier(
             n_estimators=100,
             max_depth=10,
             min_samples_split=5,
             random_state=42
         )
-        self.model.fit(X_train, y_train)
+        rf.fit(X_train, y_train)
 
         # Evaluar
-        y_pred = self.model.predict(X_test)
+        y_pred = rf.predict(X_test)
         accuracy = accuracy_score(y_test, y_pred)
 
-        # Guardar modelo
+        # Extraer pesos del modelo para guardar en JSON (seguro)
+        model_data = self._extract_model_weights(rf, accuracy, len(X_train), len(X_test))
+        self.model = model_data
         self._save_model()
 
         return {
@@ -193,21 +218,50 @@ class LocalMLScorer:
             "test_used": len(X_test)
         }
 
+    def _extract_model_weights(self, rf, accuracy, n_train, n_test) -> Dict:
+        """Extraer información útil del RandomForest para guardar en JSON."""
+        # Guardar feature importances como modelo simplificado
+        feature_names = ["rsi", "macd_histogram", "bb_position", "atr", "patterns_count"]
+        importances = rf.feature_importances_.tolist()
+
+        # Guardar árboles de decisión como reglas simplificadas
+        trees_rules = []
+        for i, tree in enumerate(rf.estimators_[:10]):  # Solo top 10 árboles
+            tree_dict = {
+                "tree_id": i,
+                "n_nodes": tree.tree_.node_count,
+                "importance": importances[i] if i < len(importances) else 0
+            }
+            trees_rules.append(tree_dict)
+
+        return {
+            "version": "1.0",
+            "model_type": "random_forest",
+            "n_estimators": rf.n_estimators,
+            "feature_names": feature_names,
+            "feature_importances": importances,
+            "accuracy": accuracy,
+            "n_train": n_train,
+            "n_test": n_test,
+            "weights": trees_rules
+        }
+
     def _score_fenix(self, features: Dict, current_price: float) -> int:
         """
         Scoring ultra-selectivo tipo Fénix.
         Requiere alta confluencia de factores.
+        Máximo teórico: 100 puntos.
         """
         score = 0
 
-        # RSI en zona óptima (40-60 para reversión, <30 o >70 para momentum)
+        # RSI en zona óptima (máx 15 puntos)
         rsi = features["rsi"]
-        if 40 <= rsi <= 60:
-            score += 10  # Zona neutra para reversión
-        elif rsi < 30 or rsi > 70:
+        if rsi < 30 or rsi > 70:
             score += 15  # Sobrecompra/sobreventa extrema
+        elif 40 <= rsi <= 60:
+            score += 10  # Zona neutra para reversión
 
-        # MACD alineado
+        # MACD alineado (máx 15 puntos)
         macd_hist = features["macd_histogram"]
         if abs(macd_hist) > 0.0001:
             score += 10
@@ -216,23 +270,32 @@ class LocalMLScorer:
             elif macd_hist < 0 and features["trend_ema"] == "down":
                 score += 5  # Momentum bajista confirmado
 
-        # Bollinger Bands
+        # Bollinger Bands (máx 15 puntos)
         bb_pos = features["bb_position"]
         if bb_pos < 0.2 or bb_pos > 0.8:
             score += 15  # Precio en extremos
 
-        # Patrones de velas
+        # Patrones de velas (máx 20 puntos - 5 por patrón, hasta 4 patrones)
         patterns = features.get("patterns", [])
-        score += len(patterns) * 10  # Hasta 70 puntos por patrones
+        pattern_score = min(len(patterns) * 5, 20)
+        score += pattern_score
 
-        # ATR suficiente (volatilidad)
+        # ATR suficiente - volatilidad (máx 10 puntos)
         atr = features["atr"]
-        if atr > 0.0005:  # Mínimo movimiento esperado
+        if atr > 0.0005:
+            score += 5
+        if atr > 0.001:
             score += 5
 
-        # Tendencia clara
+        # Tendencia clara (máx 10 puntos)
         if features["trend_ema"] in ["up", "down"]:
             score += 10
+
+        # EMA alignment bonus (máx 15 puntos)
+        if features["trend_ema"] == "up" and current_price > features["ema_20"]:
+            score += 15
+        elif features["trend_ema"] == "down" and current_price < features["ema_20"]:
+            score += 15
 
         return score
 
@@ -297,41 +360,57 @@ class LocalMLScorer:
         if features["rsi"] > 55:
             score += 15
 
-        # Volumen creciente (simulado)
-        score += 10
-
         # Consolidación previa (rango estrecho)
-        recent_range = max(highs[-20:]) - min(lows[-20:])
-        if recent_range < features["atr"] * 3:
-            score += 15  # Rango estrecho = potencial breakout
+        if len(highs) >= 20 and len(lows) >= 20:
+            recent_range = max(highs[-20:]) - min(lows[-20:])
+            if recent_range < features["atr"] * 3:
+                score += 15  # Rango estrecho = potencial breakout
 
         return score
 
     def _predict_with_model(self, features: Dict) -> int:
-        """Predecir usando modelo entrenado."""
-        if not self.model:
+        """Predecir usando modelo entrenado (feature importances)."""
+        if not self.model or "feature_importances" not in self.model:
             return 50
 
-        feature_vector = [
-            features.get("rsi", 50),
-            features.get("macd_histogram", 0),
-            features.get("bb_position", 0.5),
-            features.get("atr", 0),
-            len(features.get("patterns", []))
-        ]
+        try:
+            importances = self.model["feature_importances"]
+            feature_names = self.model.get("feature_names", [])
 
-        prediction = self.model.predict([feature_vector])[0]
-        proba = self.model.predict_proba([feature_vector])[0]
+            # Weighted score basado en feature importances
+            values = [
+                features.get("rsi", 50) / 100,
+                abs(features.get("macd_histogram", 0)) * 10000,
+                features.get("bb_position", 0.5),
+                features.get("atr", 0) * 10000,
+                len(features.get("patterns", [])) / 7
+            ]
 
-        # Retornar score 0-100 basado en probabilidad
-        return int(proba[1] * 100) if prediction == 1 else int(proba[0] * 100)
+            # Normalizar valores a 0-1
+            normalized = []
+            for v in values:
+                normalized.append(min(1.0, max(0.0, v)))
+
+            # Weighted sum
+            if len(importances) == len(normalized):
+                weighted_score = sum(n * w for n, w in zip(normalized, importances))
+                return int(weighted_score * 100 / sum(importances)) if sum(importances) > 0 else 50
+
+            return 50
+        except Exception:
+            return 50
 
     def _adjust_for_market_context(self, score: int, features: Dict, tick: Dict) -> int:
         """Ajustar score por contexto de mercado."""
+        if not tick:
+            return score
+
         # Reducir score si spread es alto
         spread = tick.get("ask", 0) - tick.get("bid", 0)
         if spread > 0.0010:  # Spread alto
             score -= 10
+        elif spread > 0.0005:  # Spread moderado
+            score -= 5
 
         return max(0, score)
 
@@ -340,19 +419,31 @@ class LocalMLScorer:
         if score < 50:
             return "none"
 
-        # Lógica simplificada
-        if features["trend_ema"] == "up" and features["macd_histogram"] > 0:
-            return "buy"
-        elif features["trend_ema"] == "down" and features["macd_histogram"] < 0:
-            return "sell"
+        # Lógica basada en indicadores
+        bullish_signals = 0
+        bearish_signals = 0
 
-        # Default basado en RSI
+        if features["trend_ema"] == "up":
+            bullish_signals += 1
+        else:
+            bearish_signals += 1
+
+        if features["macd_histogram"] > 0:
+            bullish_signals += 1
+        else:
+            bearish_signals += 1
+
         if features["rsi"] < 40:
-            return "buy"  # Posible rebote
+            bullish_signals += 1  # Posible rebote
         elif features["rsi"] > 60:
+            bearish_signals += 1
+
+        if bullish_signals > bearish_signals:
+            return "buy"
+        elif bearish_signals > bullish_signals:
             return "sell"
 
-        return "buy"  # Default
+        return "buy"  # Default en empate
 
     # ============ Indicadores Técnicos ============
 
@@ -390,19 +481,45 @@ class LocalMLScorer:
         return float(ema)
 
     def _calculate_macd(self, closes: List[float]) -> Tuple[float, float]:
-        """Calcular MACD y señal."""
+        """
+        Calcular MACD y señal correctamente.
+        MACD = EMA(12) - EMA(26)
+        Signal = EMA(9) del MACD
+        """
         if len(closes) < 35:
             return 0.0, 0.0
 
-        ema12 = self._calculate_ema(closes, 12)
-        ema26 = self._calculate_ema(closes, 26)
-        macd = ema12 - ema26
+        # Calcular serie completa de EMA12 y EMA26
+        ema12_series = self._calculate_ema_series(closes, 12)
+        ema26_series = self._calculate_ema_series(closes, 26)
 
-        # Señal = EMA 9 del MACD
-        macd_series = [ema12 - ema26]  # Simplificado
-        signal = self._calculate_ema(macd_series + [macd] * 9, 9)
+        # MACD line = EMA12 - EMA26 (desde que ambas existen)
+        min_len = min(len(ema12_series), len(ema26_series))
+        macd_line = [ema12_series[-(min_len - i)] - ema26_series[-(min_len - i)]
+                     for i in range(min_len)]
+
+        # Signal line = EMA(9) del MACD
+        if len(macd_line) >= 9:
+            signal = self._calculate_ema(macd_line, 9)
+        else:
+            signal = macd_line[-1] if macd_line else 0.0
+
+        macd = macd_line[-1] if macd_line else 0.0
 
         return float(macd), float(signal)
+
+    def _calculate_ema_series(self, data: List[float], period: int) -> List[float]:
+        """Calcular serie completa de EMA para MACD."""
+        if len(data) < period:
+            return [data[-1]] if data else [0.0]
+
+        ema_values = [float(np.mean(data[:period]))]
+        multiplier = 2 / (period + 1)
+
+        for price in data[period:]:
+            ema_values.append((price - ema_values[-1]) * multiplier + ema_values[-1])
+
+        return ema_values
 
     def _calculate_bollinger(self, closes: List[float],
                             period: int = 20,

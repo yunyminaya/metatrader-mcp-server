@@ -31,6 +31,15 @@ class DaemonTrading:
         self._next_cycle: Optional[datetime] = None
         self._stop_event = threading.Event()
 
+        # Guardar referencia al event loop del thread principal (donde corre MCP)
+        try:
+            self._event_loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self._event_loop = None
+
+        # Lock para operaciones thread-safe
+        self._lock = threading.Lock()
+
         # Configuración del ciclo
         self.cycle_minutes = config.get("ciclo_minutos", 15)
         self.symbols = config.get("pares", ["EURUSD", "XAUUSD", "GBPUSD"])
@@ -49,22 +58,19 @@ class DaemonTrading:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
-        if self.notifier:
-            asyncio.run_coroutine_threadsafe(
-                self.notifier.send("🤖 Daemon de trading iniciado"),
-                asyncio.get_event_loop()
-            )
+        self._notify_sync("🤖 Daemon de trading iniciado")
 
     def stop(self):
         """Detener el daemon gracefulmente."""
         self._running = False
         self._stop_event.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=10)
+            self._thread = None
 
     def is_running(self) -> bool:
         """Verificar si el daemon está corriendo."""
-        return self._running
+        return self._running and self._thread is not None and self._thread.is_alive()
 
     def get_last_cycle_time(self) -> Optional[str]:
         """Obtener timestamp del último ciclo."""
@@ -87,18 +93,37 @@ class DaemonTrading:
 
     def update_config(self, config: Dict):
         """Actualizar configuración en caliente."""
-        self.cycle_minutes = config.get("ciclo_minutos", self.cycle_minutes)
-        self.symbols = config.get("symbols", self.symbols)
-        self.strategy = config.get("strategy", self.strategy)
-        self.max_daily_trades = config.get("max_daily_trades", self.max_daily_trades)
-        self.risk_per_trade = config.get("risk_per_trade", self.risk_per_trade)
+        with self._lock:
+            self.cycle_minutes = config.get("ciclo_minutos", self.cycle_minutes)
+            self.symbols = config.get("symbols", self.symbols)
+            self.strategy = config.get("strategy", self.strategy)
+            self.max_daily_trades = config.get("max_daily_trades", self.max_daily_trades)
+            self.risk_per_trade = config.get("risk_per_trade", self.risk_per_trade)
 
     def force_cycle(self):
         """Forzar ejecución de un ciclo inmediatamente."""
         self._execute_cycle()
 
+    def _notify_sync(self, message: str):
+        """Enviar notificación de forma segura desde cualquier thread."""
+        if not self.notifier:
+            return
+        try:
+            if self._event_loop and self._event_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self.notifier.send(message),
+                    self._event_loop
+                )
+            else:
+                # Si no hay loop async, usar print como fallback
+                print(f"[Daemon Notify] {message}")
+        except Exception as e:
+            print(f"[Daemon Notify Error] {e}")
+
     def _run_loop(self):
         """Loop principal del daemon."""
+        print("[Daemon] Loop principal iniciado")
+
         while self._running and not self._stop_event.is_set():
             try:
                 # Verificar si es hora de operar
@@ -109,7 +134,8 @@ class DaemonTrading:
                 self._next_cycle = datetime.now() + timedelta(minutes=self.cycle_minutes)
 
                 # Esperar hasta el próximo ciclo (chequeando stop cada segundo)
-                for _ in range(self.cycle_minutes * 60):
+                wait_seconds = self.cycle_minutes * 60
+                for _ in range(wait_seconds):
                     if self._stop_event.is_set():
                         break
                     time.sleep(1)
@@ -117,6 +143,8 @@ class DaemonTrading:
             except Exception as e:
                 print(f"[Daemon Error] {e}")
                 time.sleep(60)  # Esperar 1 min en caso de error
+
+        print("[Daemon] Loop principal terminado")
 
     def _should_trade(self) -> bool:
         """Verificar condiciones para operar."""
@@ -142,8 +170,10 @@ class DaemonTrading:
 
         # Verificar conexión a MT5
         if not self.mt5.is_connected():
+            print("[Daemon] MT5 desconectado, intentando reconexión...")
             self.mt5.reconnect()
             if not self.mt5.is_connected():
+                print("[Daemon] No se pudo reconectar a MT5")
                 return False
 
         return True
@@ -164,18 +194,26 @@ class DaemonTrading:
             print(f"[Daemon] Límite diario alcanzado ({today_trades}/{self.max_daily_trades})")
             return
 
-        # 3. Analizar cada símbolo
+        # 3. Guardar snapshot de cuenta
+        try:
+            account = self.mt5.get_account_info()
+            positions = self.mt5.get_positions()
+            self.db.save_account_snapshot(account, len(positions))
+        except Exception as e:
+            print(f"[Daemon] Error guardando snapshot: {e}")
+
+        # 4. Analizar cada símbolo
         for symbol in self.symbols:
             try:
                 self._analyze_and_trade(symbol)
             except Exception as e:
                 print(f"[Daemon Error] {symbol}: {e}")
 
-        # 4. Gestionar posiciones abiertas (trailing stops, breakeven)
+        # 5. Gestionar posiciones abiertas (trailing stops, breakeven)
         self._manage_open_positions()
 
-        # 5. Notificar resumen
-        if self.notifier:
+        # 6. Notificar resumen
+        try:
             account = self.mt5.get_account_info()
             msg = (
                 f"📊 Ciclo completado\n"
@@ -183,10 +221,9 @@ class DaemonTrading:
                 f"Equity: ${account.get('equity', 0):.2f}\n"
                 f"Trades hoy: {today_trades}/{self.max_daily_trades}"
             )
-            asyncio.run_coroutine_threadsafe(
-                self.notifier.send(msg),
-                asyncio.get_event_loop()
-            )
+            self._notify_sync(msg)
+        except Exception:
+            pass
 
     def _analyze_and_trade(self, symbol: str):
         """Analizar símbolo y ejecutar trade si cumple criterios."""
@@ -208,12 +245,20 @@ class DaemonTrading:
             direction = features.get("direction", "buy")
 
             # Calcular lot size basado en riesgo
-            stop_loss_pips = self._calculate_stop_loss(features)
+            stop_loss_pips = self._calculate_stop_loss(features, symbol)
             lot_size = self._calculate_lot_size(symbol, stop_loss_pips)
 
             # Calcular SL/TP
-            point = self.mt5.get_symbol_info(symbol).get("point", 0.00001)
-            sl_distance = stop_loss_pips * point * (100 if "JPY" in symbol else 10)
+            symbol_info = self.mt5.get_symbol_info(symbol)
+            point = symbol_info.get("point", 0.00001)
+            digits = symbol_info.get("digits", 5)
+
+            if "JPY" in symbol:
+                sl_distance = stop_loss_pips * point * 100
+            elif "XAU" in symbol or "GOLD" in symbol:
+                sl_distance = stop_loss_pips * point * 10
+            else:
+                sl_distance = stop_loss_pips * point * 10
 
             if direction == "buy":
                 sl = tick["bid"] - sl_distance
@@ -236,8 +281,8 @@ class DaemonTrading:
                 symbol=symbol,
                 order_type=order_type,
                 volume=lot_size,
-                stop_loss=round(sl, 5),
-                take_profit=round(tp, 5),
+                stop_loss=round(sl, digits),
+                take_profit=round(tp, digits),
                 comment=f"Daemon Score:{score}"
             )
 
@@ -255,17 +300,13 @@ class DaemonTrading:
                     "timestamp": datetime.now().isoformat()
                 })
 
-                if self.notifier:
-                    asyncio.run_coroutine_threadsafe(
-                        self.notifier.send(
-                            f"🎯 Trade ejecutado\n"
-                            f"{symbol} {order_type.upper()}\n"
-                            f"Lote: {lot_size}\n"
-                            f"Score: {score}/100\n"
-                            f"SL: {sl:.5f} | TP: {tp:.5f}"
-                        ),
-                        asyncio.get_event_loop()
-                    )
+                self._notify_sync(
+                    f"🎯 Trade ejecutado\n"
+                    f"{symbol} {order_type.upper()}\n"
+                    f"Lote: {lot_size}\n"
+                    f"Score: {score}/100\n"
+                    f"SL: {sl:.{digits}f} | TP: {tp:.{digits}f}"
+                )
 
                 print(f"[Daemon] {symbol} Trade ejecutado - Ticket: {result.get('ticket')}")
 
@@ -279,47 +320,62 @@ class DaemonTrading:
                 profit = pos["profit"]
                 open_price = pos["open_price"]
                 current_sl = pos.get("sl", 0)
-                order_type = pos["type"]  # 0=buy, 1=sell
+                order_type = pos["type"]  # "buy" o "sell" (string desde mt5_client)
 
                 # Obtener tick actual
                 tick = self.mt5.get_tick(symbol)
                 if not tick:
                     continue
 
-                # Breakeven: Si profit > X pips, mover SL a entrada
-                point = self.mt5.get_symbol_info(symbol).get("point", 0.00001)
-                pip_value = point * 100 if "JPY" in symbol else point * 10
+                # Obtener info del símbolo
+                symbol_info = self.mt5.get_symbol_info(symbol)
+                point = symbol_info.get("point", 0.00001)
+                digits = symbol_info.get("digits", 5)
 
-                profit_pips = abs(profit / (pos["volume"] * 10))  # Aprox
+                if "JPY" in symbol:
+                    pip_value = point * 100
+                else:
+                    pip_value = point * 10
 
-                if profit_pips > 20 and current_sl == 0:  # 20 pips de profit
-                    new_sl = open_price
+                # Calcular profit en pips de forma más precisa
+                if order_type == "buy":
+                    profit_pips = (tick["bid"] - open_price) / pip_value
+                else:
+                    profit_pips = (open_price - tick["ask"]) / pip_value
+
+                # Breakeven: Si profit > 20 pips, mover SL a entrada
+                if profit_pips > 20 and (current_sl == 0 or
+                    (order_type == "buy" and current_sl < open_price) or
+                    (order_type == "sell" and (current_sl > open_price or current_sl == 0))):
+                    new_sl = round(open_price, digits)
                     self.mt5.modify_position(pos["ticket"], stop_loss=new_sl)
-                    print(f"[Daemon] {symbol} Breakeven activado")
+                    print(f"[Daemon] {symbol} Breakeven activado en {open_price:.{digits}f}")
 
-                # Trailing stop escalonado
+                # Trailing stop escalonado: Si profit > 50 pips, mover SL a +30 pips
                 elif profit_pips > 50:
-                    # Mover SL a +30 pips de profit
-                    if order_type == 0:  # Buy
-                        new_sl = open_price + (30 * pip_value)
+                    if order_type == "buy":  # String comparison - FIXED
+                        new_sl = round(open_price + (30 * pip_value), digits)
                         if new_sl > current_sl:
                             self.mt5.modify_position(pos["ticket"], stop_loss=new_sl)
-                    else:  # Sell
-                        new_sl = open_price - (30 * pip_value)
+                            print(f"[Daemon] {symbol} Trailing stop activado: SL -> {new_sl:.{digits}f}")
+                    elif order_type == "sell":  # String comparison - FIXED
+                        new_sl = round(open_price - (30 * pip_value), digits)
                         if new_sl < current_sl or current_sl == 0:
                             self.mt5.modify_position(pos["ticket"], stop_loss=new_sl)
+                            print(f"[Daemon] {symbol} Trailing stop activado: SL -> {new_sl:.{digits}f}")
 
             except Exception as e:
-                print(f"[Daemon Error] Gestionando posición: {e}")
+                print(f"[Daemon Error] Gestionando posición {pos.get('ticket', '?')}: {e}")
 
-    def _calculate_stop_loss(self, features: Dict) -> int:
+    def _calculate_stop_loss(self, features: Dict, symbol: str = "") -> int:
         """Calcular stop loss en pips basado en ATR o volatilidad."""
         atr = features.get("atr", 0.0010)
-        symbol = features.get("symbol", "EURUSD")
 
         # Convertir ATR a pips
         if "JPY" in symbol:
             sl_pips = int(atr * 10000 * 1.5)  # 1.5x ATR
+        elif "XAU" in symbol or "GOLD" in symbol:
+            sl_pips = int(atr * 100 * 1.5)
         else:
             sl_pips = int(atr * 10000 * 1.5)
 
@@ -334,17 +390,85 @@ class DaemonTrading:
         # Riesgo en dólares
         risk_amount = balance * (self.risk_per_trade / 100)
 
-        # Valor por pip (aproximado)
+        # Valor por pip (aproximado para 1 lote estándar)
         if "JPY" in symbol:
-            pip_value = 0.01  # Para 0.01 lotes en pares JPY
+            pip_value_per_lot = 1000  # $1000 por pip por lote en USD/JPY
+        elif "XAU" in symbol or "GOLD" in symbol:
+            pip_value_per_lot = 1  # $1 por pip por lote en XAUUSD
         else:
-            pip_value = 0.10  # Para 0.01 lotes en pares normales
+            pip_value_per_lot = 10  # $10 por pip por lote en pares majors
 
         # Calcular lotes
-        lot_size = risk_amount / (stop_loss_pips * pip_value)
+        lot_size = risk_amount / (stop_loss_pips * pip_value_per_lot)
 
         # Normalizar a lotes estándar
         lot_size = round(lot_size / 0.01) * 0.01
         lot_size = max(0.01, min(lot_size, 10.0))  # Limitar
 
         return lot_size
+
+
+def main():
+    """Punto de entrada para ejecución directa del daemon."""
+    import json
+    from pathlib import Path
+
+    config_path = Path.home() / ".metatrader-mcp" / "config.json"
+    if not config_path.exists():
+        print("Error: No se encontró configuración en ~/.metatrader-mcp/config.json")
+        print("Ejecuta: metatrader-mcp-autonomous para configurar")
+        return
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    from database import TradingDatabase
+    from risk_manager import RiskManager
+    from ml_local import LocalMLScorer
+    from notifier import TelegramNotifier, ConsoleNotifier
+    from mt5_client import MT5Client
+
+    # Inicializar componentes
+    db_path = Path.home() / ".metatrader-mcp" / "trading.db"
+    db = TradingDatabase(str(db_path))
+    db.init_tables()
+
+    risk_mgr = RiskManager(db, config.get("riesgo", {}))
+    ml_scorer = LocalMLScorer(db)
+
+    telegram_token = config.get("telegram", {}).get("token")
+    telegram_chat = config.get("telegram", {}).get("chat_id")
+    if telegram_token and telegram_chat:
+        notifier = TelegramNotifier(telegram_token, telegram_chat)
+    else:
+        notifier = ConsoleNotifier()
+
+    mt5 = MT5Client(
+        login=config.get("mt5", {}).get("login"),
+        password=config.get("mt5", {}).get("password"),
+        server=config.get("mt5", {}).get("server"),
+        path=config.get("mt5", {}).get("path")
+    )
+
+    if not mt5.connect():
+        print("Error: No se pudo conectar a MT5")
+        return
+
+    # Crear y ejecutar daemon
+    daemon = DaemonTrading(mt5, db, risk_mgr, ml_scorer, notifier, config)
+    daemon.start()
+
+    print("Daemon corriendo. Presiona Ctrl+C para detener.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nDeteniendo daemon...")
+        daemon.stop()
+        mt5.disconnect()
+        db.close()
+        print("Daemon detenido.")
+
+
+if __name__ == "__main__":
+    main()

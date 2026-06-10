@@ -1,19 +1,17 @@
 # Archivos de configuración con datos personales
 config.json
-*.json
 !config/default.json
 !config/example.json
-!pyproject.toml
 
 # Base de datos local (contiene datos de trading)
 *.db
 *.sqlite
 *.sqlite3
-trading.db
 
 # Modelos ML entrenados
 *.pkl
 *.model
+ml_model.json
 
 # Logs
 *.log

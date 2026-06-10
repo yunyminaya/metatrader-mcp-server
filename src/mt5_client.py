@@ -96,7 +96,7 @@ class MT5Client:
         try:
             info = self.mt5.account_info()
             return info is not None
-        except:
+        except Exception:
             self._connected = False
             return False
 
