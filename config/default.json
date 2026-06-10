@@ -1,4 +1,5 @@
 {
+  "broker_type": "mt5",
   "autonomo": true,
   "ciclo_minutos": 15,
   "max_operaciones_dia": 5,
@@ -8,6 +9,7 @@
     "server": null,
     "path": null
   },
+  "mt4_bridge_path": null,
   "pares": [
     "EURUSD",
     "XAUUSD",

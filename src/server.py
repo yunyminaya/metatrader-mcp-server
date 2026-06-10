@@ -32,7 +32,9 @@ try:
     from .risk_manager import RiskManager
     from .ml_local import LocalMLScorer
     from .notifier import TelegramNotifier, ConsoleNotifier
+    from .broker_client import BrokerClient
     from .mt5_client import MT5Client
+    from .mt4_bridge import MT4BridgeClient
     from .daemon_trading import DaemonTrading
 except ImportError:
     # Fallback para ejecución directa: python src/server.py
@@ -40,7 +42,9 @@ except ImportError:
     from risk_manager import RiskManager
     from ml_local import LocalMLScorer
     from notifier import TelegramNotifier, ConsoleNotifier
+    from broker_client import BrokerClient
     from mt5_client import MT5Client
+    from mt4_bridge import MT4BridgeClient
     from daemon_trading import DaemonTrading
 
 
@@ -53,14 +57,14 @@ _db: Optional[TradingDatabase] = None
 _risk_mgr: Optional[RiskManager] = None
 _ml_scorer: Optional[LocalMLScorer] = None
 _notifier: Optional[Any] = None  # TelegramNotifier o ConsoleNotifier
-_mt5: Optional[MT5Client] = None
+_broker: Optional[BrokerClient] = None  # MT5Client o MT4BridgeClient
 _daemon: Optional[DaemonTrading] = None
 
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[Dict]:
     """Maneja el ciclo de vida del servidor."""
-    global _db, _risk_mgr, _ml_scorer, _notifier, _mt5, _daemon
+    global _db, _risk_mgr, _ml_scorer, _notifier, _broker, _daemon
 
     # Cargar configuración
     config_path = Path.home() / ".metatrader-mcp" / "config.json"
@@ -85,18 +89,36 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[Dict]:
     else:
         _notifier = ConsoleNotifier()
 
-    # Conectar a MT5
-    _mt5 = MT5Client(
-        login=config.get("mt5", {}).get("login"),
-        password=config.get("mt5", {}).get("password"),
-        server=config.get("mt5", {}).get("server"),
-        path=config.get("mt5", {}).get("path")
-    )
-    _mt5.connect()
+    # Crear broker client según configuración (MT4 o MT5)
+    broker_type = config.get("broker_type", "mt5").lower()
+    bridge_path = config.get("mt4_bridge_path", None)
+
+    if broker_type == "mt4":
+        print("[MCP] Usando MetaTrader 4 (Bridge EA)")
+        _broker = MT4BridgeClient(
+            bridge_path=bridge_path,
+            login=config.get("mt5", {}).get("login"),
+            password=config.get("mt5", {}).get("password"),
+            server=config.get("mt5", {}).get("server"),
+        )
+    else:
+        print("[MCP] Usando MetaTrader 5 (Python API)")
+        _broker = MT5Client(
+            login=config.get("mt5", {}).get("login"),
+            password=config.get("mt5", {}).get("password"),
+            server=config.get("mt5", {}).get("server"),
+            path=config.get("mt5", {}).get("path")
+        )
+
+    _broker.connect()
+
+    # Establecer referencia al broker en risk manager
+    if _risk_mgr:
+        _risk_mgr.set_mt5_client(_broker)
 
     # Iniciar modo daemon si está configurado
     if config.get("autonomo", False):
-        _daemon = DaemonTrading(_mt5, _db, _risk_mgr, _ml_scorer, _notifier, config)
+        _daemon = DaemonTrading(_broker, _db, _risk_mgr, _ml_scorer, _notifier, config)
         _daemon.start()
         if _notifier:
             try:
@@ -106,7 +128,8 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[Dict]:
 
     yield {
         "db": _db,
-        "mt5": _mt5,
+        "mt5": _broker,  # Mantener nombre "mt5" para compatibilidad con tools
+        "broker": _broker,
         "daemon": _daemon,
         "risk_mgr": _risk_mgr,
         "ml_scorer": _ml_scorer,
@@ -117,8 +140,8 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[Dict]:
     # Cleanup
     if _daemon:
         _daemon.stop()
-    if _mt5:
-        _mt5.disconnect()
+    if _broker:
+        _broker.disconnect()
     if _db:
         _db.close()
 
@@ -130,6 +153,18 @@ mcp = FastMCP("metatrader-autonomous", lifespan=app_lifespan)
 # ============================================================
 # TOOLS - INFORMACIÓN DE CUENTA
 # ============================================================
+
+@mcp.tool()
+def get_broker_info(ctx: Context) -> Dict[str, Any]:
+    """Obtener información del broker (MT4 o MT5)."""
+    broker = ctx.request_context.lifespan_context.get("broker")
+    if not broker:
+        return {"error": "Broker no conectado"}
+    return {
+        "broker_type": broker.get_broker_type(),
+        "connected": broker.is_connected(),
+        "account_info": broker.get_account_info()
+    }
 
 @mcp.tool()
 def get_account_info(ctx: Context) -> Dict[str, Any]:

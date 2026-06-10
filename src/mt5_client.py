@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
 MT5 Client - Cliente para MetaTrader 5
-Conecta y opera en MT4/MT5.
+Conecta y opera en MT5. Hereda de BrokerClient.
 """
 
 from typing import Dict, List, Optional, Any
 import time
 
+try:
+    from .broker_client import BrokerClient
+except ImportError:
+    from broker_client import BrokerClient
 
-class MT5Client:
+
+class MT5Client(BrokerClient):
     """
     Cliente para conectar y operar en MetaTrader 5.
-    Soporta reconnexión automática.
+    Soporta reconexión automática.
     """
 
     def __init__(self, login: Optional[int] = None,
@@ -26,6 +31,10 @@ class MT5Client:
         self.mt5 = None
         self._connected = False
         self._last_connection_attempt = 0
+
+    def get_broker_type(self) -> str:
+        """Retorna 'mt5'."""
+        return "mt5"
 
     def connect(self) -> bool:
         """Conectar a MetaTrader 5."""
@@ -277,9 +286,7 @@ class MT5Client:
             return {"success": False, "error": f"Error: {result.retcode}"}
 
     def set_trailing_stop(self, ticket: int, points: int) -> Dict[str, Any]:
-        """Activar trailing stop (usando SL dinámico)."""
-        # MT5 no tiene trailing stop nativo en la API
-        # Hay que implementarlo manualmente en el daemon
+        """Activar trailing stop (implementado en daemon_trading.py)."""
         return {
             "success": False,
             "error": "Trailing stop implementado en daemon_trading.py"

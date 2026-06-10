@@ -1,5 +1,7 @@
 {
   "_comment": "EJEMPLO DE CONFIGURACIÓN - Copia este archivo y renómbralo a config.json en ~/.metatrader-mcp/",
+  "broker_type": "mt5",
+  "_broker_type_options": "mt5 = MetaTrader 5 (Python API directo) | mt4 = MetaTrader 4 (via Bridge EA)",
   "autonomo": true,
   "ciclo_minutos": 15,
   "max_operaciones_dia": 5,
@@ -9,6 +11,8 @@
     "server": "MetaQuotes-Demo",
     "path": null
   },
+  "mt4_bridge_path": null,
+  "_mt4_bridge_path_comment": "Solo para MT4: ruta a la carpeta del bridge (ej: C:\\MT4_Bridge). Dejar null para auto-detect.",
   "pares": [
     "EURUSD",
     "XAUUSD",
